@@ -141,7 +141,6 @@ class StorageVirtualNode:
         
         # Update metrics
         transfer.status = TransferStatus.IN_PROGRESS
-        self.network_utilization = bandwidth_used_bps
         self.total_data_transferred += chunk.size
         
         # Check if all chunks are completed
@@ -152,7 +151,6 @@ class StorageVirtualNode:
             self.stored_files[file_id] = transfer
             del self.active_transfers[file_id]
             self.total_requests_processed += 1
-            self.network_utilization = 0
         
         return True
 
