@@ -1,5 +1,5 @@
-import time
 import math
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 from enum import Enum, auto
@@ -26,7 +26,7 @@ class FileTransfer:
     total_size: int  # in bytes
     chunks: List[FileChunk]
     status: TransferStatus = TransferStatus.PENDING
-    created_at: float = time.time()
+    created_at: float = 0.0
     completed_at: Optional[float] = None
 
 class StorageVirtualNode:
@@ -95,6 +95,7 @@ class StorageVirtualNode:
         file_id: str,
         file_name: str,
         file_size: int,
+        current_time: float,
         source_node: Optional[str] = None
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
@@ -108,7 +109,8 @@ class StorageVirtualNode:
             file_id=file_id,
             file_name=file_name,
             total_size=file_size,
-            chunks=chunks
+            chunks=chunks,
+            created_at=current_time
         )
         
         self.active_transfers[file_id] = transfer
@@ -118,7 +120,9 @@ class StorageVirtualNode:
         self,
         file_id: str,
         chunk_id: int,
-        source_node: str
+        source_node: str,
+        completed_time: float,
+        bandwidth_used_bps: int
     ) -> bool:
         """Process an incoming file chunk"""
         if file_id not in self.active_transfers:
@@ -131,36 +135,24 @@ class StorageVirtualNode:
         except StopIteration:
             return False
         
-        # Simulate network transfer time
-        chunk_size_bits = chunk.size * 8  # Convert bytes to bits
-        available_bandwidth = min(
-            self.bandwidth - self.network_utilization,
-            self.connections.get(source_node, 0)
-        )
-        
-        if available_bandwidth <= 0:
-            return False
-        
-        # Calculate transfer time (in seconds)
-        transfer_time = chunk_size_bits / available_bandwidth
-        time.sleep(transfer_time)  # Simulate transfer delay
-        
         # Update chunk status
         chunk.status = TransferStatus.COMPLETED
         chunk.stored_node = self.node_id
         
         # Update metrics
-        self.network_utilization += available_bandwidth * 0.8  # Simulate some fluctuation
+        transfer.status = TransferStatus.IN_PROGRESS
+        self.network_utilization = bandwidth_used_bps
         self.total_data_transferred += chunk.size
         
         # Check if all chunks are completed
         if all(c.status == TransferStatus.COMPLETED for c in transfer.chunks):
             transfer.status = TransferStatus.COMPLETED
-            transfer.completed_at = time.time()
+            transfer.completed_at = completed_time
             self.used_storage += transfer.total_size
             self.stored_files[file_id] = transfer
             del self.active_transfers[file_id]
             self.total_requests_processed += 1
+            self.network_utilization = 0
         
         return True
 
