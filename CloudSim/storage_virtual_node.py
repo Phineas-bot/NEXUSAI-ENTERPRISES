@@ -62,6 +62,24 @@ class StorageVirtualNode:
         """Add a network connection to another node"""
         self.connections[node_id] = bandwidth * 1000000  # Store in bits per second
 
+    def clone(
+        self,
+        node_id: str,
+        storage_factor: float = 1.0,
+        bandwidth_factor: float = 1.0,
+    ) -> "StorageVirtualNode":
+        """Create a replica node with proportional resources."""
+        storage_gb = max(1, math.ceil((self.total_storage / (1024 ** 3)) * storage_factor))
+        bandwidth_mbps = max(1, math.ceil((self.bandwidth / 1000000) * bandwidth_factor))
+        replica = StorageVirtualNode(
+            node_id,
+            cpu_capacity=self.cpu_capacity,
+            memory_capacity=self.memory_capacity,
+            storage_capacity=storage_gb,
+            bandwidth=bandwidth_mbps,
+        )
+        return replica
+
     def _calculate_chunk_size(self, file_size: int) -> int:
         """Determine optimal chunk size based on file size"""
         # Simple heuristic: larger files get larger chunks
@@ -100,7 +118,8 @@ class StorageVirtualNode:
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
         # Check if we have enough storage space
-        if self.used_storage + file_size > self.total_storage:
+        projected_usage = self.used_storage + sum(t.total_size for t in self.active_transfers.values())
+        if projected_usage + file_size > self.total_storage:
             return None
         
         # Create file transfer record

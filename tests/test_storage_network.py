@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -8,35 +9,40 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from simulator import Simulator  # noqa: E402
-from storage_virtual_network import StorageVirtualNetwork  # noqa: E402
+from storage_virtual_network import DemandScalingConfig, StorageVirtualNetwork  # noqa: E402
 from storage_virtual_node import StorageVirtualNode, TransferStatus  # noqa: E402
 
 FILE_SIZE = 100 * 1024 * 1024  # 100MB
 BANDWIDTH_MBPS = 1000
 
 
-def _build_network():
+def _build_network(
+    source_storage_gb: int = 500,
+    target_storage_gb: int = 500,
+    bandwidth_mbps: int = BANDWIDTH_MBPS,
+    scaling_config: Optional[DemandScalingConfig] = None,
+):
     sim = Simulator()
-    network = StorageVirtualNetwork(sim, tick_interval=0.005)
+    network = StorageVirtualNetwork(sim, tick_interval=0.005, scaling_config=scaling_config)
 
     source = StorageVirtualNode(
         "node-a",
         cpu_capacity=4,
         memory_capacity=16,
-        storage_capacity=500,
-        bandwidth=BANDWIDTH_MBPS,
+        storage_capacity=source_storage_gb,
+        bandwidth=bandwidth_mbps,
     )
     target = StorageVirtualNode(
         "node-b",
         cpu_capacity=8,
         memory_capacity=32,
-        storage_capacity=500,
-        bandwidth=BANDWIDTH_MBPS,
+        storage_capacity=target_storage_gb,
+        bandwidth=bandwidth_mbps,
     )
 
     network.add_node(source)
     network.add_node(target)
-    network.connect_nodes(source.node_id, target.node_id, bandwidth=BANDWIDTH_MBPS)
+    network.connect_nodes(source.node_id, target.node_id, bandwidth=bandwidth_mbps)
 
     return sim, network
 
@@ -80,3 +86,36 @@ def test_concurrent_transfers_share_bandwidth():
 
     # Target node should now store both files
     assert transfer_two.total_size + transfer_one.total_size == FILE_SIZE * 2
+
+
+def test_demand_scaling_spawns_replicas_for_hot_targets():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        storage_utilization_threshold=0.5,
+        bandwidth_utilization_threshold=0.95,
+        max_replicas_per_root=3,
+    )
+
+    sim, network = _build_network(target_storage_gb=1, scaling_config=scaling)
+    large_file = 600 * 1024 * 1024  # 600MB
+
+    transfers = []
+    for idx in range(3):
+        transfer = network.initiate_file_transfer("node-a", "node-b", f"scaling-{idx}.bin", large_file)
+        assert transfer is not None
+        transfers.append(transfer)
+
+    sim.run()
+
+    cluster_nodes = network.get_cluster_nodes("node-b")
+    assert len(cluster_nodes) >= 2
+
+    total_stored = sum(
+        network.nodes[node_id].used_storage
+        for node_id in cluster_nodes
+        if node_id in network.nodes
+    )
+    assert total_stored >= large_file * len(transfers)
+
+    for transfer in transfers:
+        assert transfer.status == TransferStatus.COMPLETED

@@ -24,13 +24,29 @@ class ActiveChunk:
     chunk: FileChunk
     remaining_bytes: float
 
+@dataclass
+class DemandScalingConfig:
+    enabled: bool = False
+    storage_utilization_threshold: float = 0.8
+    bandwidth_utilization_threshold: float = 0.85
+    max_replicas_per_root: int = 3
+    replica_storage_factor: float = 1.0
+    replica_bandwidth_factor: float = 1.0
+
+
 class StorageVirtualNetwork:
-    def __init__(self, simulator: Simulator, tick_interval: float = 0.01):
+    def __init__(
+        self,
+        simulator: Simulator,
+        tick_interval: float = 0.01,
+        scaling_config: Optional[DemandScalingConfig] = None,
+    ):
         self.simulator = simulator
         self.tick_interval = tick_interval
         self.nodes: Dict[str, StorageVirtualNode] = {}
         self.transfer_operations: Dict[str, Dict[str, FileTransfer]] = defaultdict(dict)
         self.transfer_observers: List[Callable[[Dict[str, Any]], None]] = []
+        self.scaling = scaling_config or DemandScalingConfig()
 
         # Concurrent transfer bookkeeping
         self.active_chunks: Dict[ChunkKey, ActiveChunk] = {}
@@ -38,10 +54,15 @@ class StorageVirtualNetwork:
         self.node_active_chunks: Dict[str, Set[ChunkKey]] = defaultdict(set)
         self.chunk_bandwidths: Dict[ChunkKey, float] = defaultdict(float)
         self._tick_scheduled = False
+
+        # Replica/cluster bookkeeping for decentralized scaling
+        self.node_roots: Dict[str, str] = {}
+        self.cluster_nodes: Dict[str, Set[str]] = defaultdict(set)
         
-    def add_node(self, node: StorageVirtualNode):
+    def add_node(self, node: StorageVirtualNode, root_id: Optional[str] = None):
         """Add a node to the network"""
         self.nodes[node.node_id] = node
+        self._register_node_cluster(node.node_id, root_id)
         
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int):
         """Connect two nodes with specified bandwidth"""
@@ -61,12 +82,17 @@ class StorageVirtualNetwork:
         """Initiate a file transfer between nodes"""
         if source_node_id not in self.nodes or target_node_id not in self.nodes:
             return None
+
+        effective_target_id = self._ensure_target_capacity(target_node_id, file_size)
+        if not effective_target_id:
+            return None
+        target_node = self.nodes[effective_target_id]
+        self._maybe_expand_cluster(effective_target_id)
             
         # Generate unique file ID
         file_id = hashlib.md5(f"{file_name}-{self.simulator.now}".encode()).hexdigest()
         
         # Request storage on target node
-        target_node = self.nodes[target_node_id]
         transfer = target_node.initiate_file_transfer(
             file_id,
             file_name,
@@ -74,10 +100,24 @@ class StorageVirtualNetwork:
             current_time=self.simulator.now,
             source_node=source_node_id,
         )
-        
+
+        if not transfer and self.scaling.enabled:
+            retry_target_id = self._spawn_replica_node(effective_target_id) or effective_target_id
+            next_target_id = self._select_storage_node(retry_target_id, file_size)
+            if next_target_id and next_target_id in self.nodes:
+                target_node = self.nodes[next_target_id]
+                transfer = target_node.initiate_file_transfer(
+                    file_id,
+                    file_name,
+                    file_size,
+                    current_time=self.simulator.now,
+                    source_node=source_node_id,
+                )
+                effective_target_id = next_target_id
+
         if transfer:
             self.transfer_operations[source_node_id][file_id] = transfer
-            self._schedule_next_chunk(source_node_id, target_node_id, file_id)
+            self._schedule_next_chunk(source_node_id, effective_target_id, file_id)
             return transfer
         return None
     
@@ -106,6 +146,10 @@ class StorageVirtualNetwork:
         """Register a callback to receive transfer events."""
         self.transfer_observers.append(callback)
 
+    def get_cluster_nodes(self, node_id: str) -> Set[str]:
+        """Return the cluster (root + replicas) for a given node id."""
+        return set(self._get_cluster_nodes(node_id))
+
     def _emit_event(self, event_type: str, **payload: Any) -> None:
         event = {"type": event_type, "time": self.simulator.now, **payload}
         for observer in self.transfer_observers:
@@ -130,6 +174,121 @@ class StorageVirtualNetwork:
         if not self._tick_scheduled:
             self._tick_scheduled = True
             self.simulator.schedule_in(0.0, self._network_tick)
+
+    def _register_node_cluster(self, node_id: str, root_id: Optional[str] = None) -> None:
+        root = root_id or self.node_roots.get(node_id) or node_id
+        self.node_roots[node_id] = root
+        cluster = self.cluster_nodes.setdefault(root, set())
+        cluster.add(node_id)
+
+    def _get_root_id(self, node_id: str) -> str:
+        return self.node_roots.get(node_id, node_id)
+
+    def _get_cluster_nodes(self, node_id: str) -> Set[str]:
+        root = self._get_root_id(node_id)
+        if root not in self.cluster_nodes and root in self.nodes:
+            self.cluster_nodes[root] = {root}
+            self.node_roots[root] = root
+        return self.cluster_nodes.get(root, set())
+
+    def _select_storage_node(self, requested_node_id: str, required_size: Optional[int] = None) -> Optional[str]:
+        candidates = [
+            self.nodes[node_id]
+            for node_id in self._get_cluster_nodes(requested_node_id)
+            if node_id in self.nodes
+        ]
+        if not candidates:
+            return None
+
+        def projected_usage(node: StorageVirtualNode) -> float:
+            pending = sum(t.total_size for t in node.active_transfers.values())
+            return node.used_storage + pending
+
+        def has_capacity(node: StorageVirtualNode) -> bool:
+            if required_size is None:
+                return True
+            return (projected_usage(node) + required_size) <= node.total_storage
+
+        eligible = [node for node in candidates if has_capacity(node)]
+        if not eligible:
+            return None
+
+        eligible.sort(
+            key=lambda n: (projected_usage(n) / n.total_storage) if n.total_storage else 0.0
+        )
+        return eligible[0].node_id
+
+    def _ensure_target_capacity(self, requested_node_id: str, file_size: int) -> Optional[str]:
+        target_id = self._select_storage_node(requested_node_id, file_size)
+        if target_id:
+            return target_id
+
+        if not self.scaling.enabled:
+            return None
+
+        reference_candidates = list(self._get_cluster_nodes(requested_node_id)) or [requested_node_id]
+        for candidate_id in reference_candidates:
+            if candidate_id in self.nodes:
+                self._spawn_replica_node(candidate_id)
+                break
+
+        return self._select_storage_node(requested_node_id, file_size)
+
+    def _spawn_replica_node(self, reference_node_id: str) -> Optional[str]:
+        if not self.scaling.enabled or reference_node_id not in self.nodes:
+            return None
+
+        root_id = self._get_root_id(reference_node_id)
+        cluster = self._get_cluster_nodes(root_id)
+        if len(cluster) - 1 >= self.scaling.max_replicas_per_root:
+            return None
+
+        reference_node = self.nodes[reference_node_id]
+        replica_suffix = len(cluster)
+        replica_id = f"{root_id}-replica-{replica_suffix}"
+        while replica_id in self.nodes:
+            replica_suffix += 1
+            replica_id = f"{root_id}-replica-{replica_suffix}"
+
+        replica = reference_node.clone(
+            replica_id,
+            storage_factor=self.scaling.replica_storage_factor,
+            bandwidth_factor=self.scaling.replica_bandwidth_factor,
+        )
+        self.add_node(replica, root_id=root_id)
+
+        for neighbor_id, bandwidth_bps in reference_node.connections.items():
+            if neighbor_id not in self.nodes:
+                continue
+            bandwidth_mbps = max(1, int(bandwidth_bps / 1000000))
+            self.connect_nodes(replica_id, neighbor_id, bandwidth=bandwidth_mbps)
+
+        parent_link_bandwidth = max(1, int(reference_node.bandwidth / 1000000))
+        self.connect_nodes(replica_id, reference_node.node_id, bandwidth=parent_link_bandwidth)
+        return replica_id
+
+    def _is_node_overloaded(self, node: StorageVirtualNode) -> bool:
+        if not self.scaling.enabled:
+            return False
+        storage_ratio = (node.used_storage / node.total_storage) if node.total_storage else 0.0
+        bandwidth_ratio = (node.network_utilization / node.bandwidth) if node.bandwidth else 0.0
+        return (
+            storage_ratio >= self.scaling.storage_utilization_threshold
+            or bandwidth_ratio >= self.scaling.bandwidth_utilization_threshold
+        )
+
+    def _maybe_expand_cluster(self, node_id: str) -> None:
+        if not self.scaling.enabled or node_id not in self.nodes:
+            return
+        root_id = self._get_root_id(node_id)
+        cluster = self._get_cluster_nodes(root_id)
+        if len(cluster) - 1 >= self.scaling.max_replicas_per_root:
+            return
+        overloaded = [self.nodes[nid] for nid in cluster if nid in self.nodes and self._is_node_overloaded(self.nodes[nid])]
+        if not overloaded:
+            return
+        overloaded.sort(key=lambda n: n.network_utilization, reverse=True)
+        self._spawn_replica_node(overloaded[0].node_id)
 
     def _schedule_next_chunk(self, source_node_id: str, target_node_id: str, file_id: str) -> None:
         transfer = self.transfer_operations[source_node_id].get(file_id)
@@ -297,6 +456,8 @@ class StorageVirtualNetwork:
         if not chunk_keys:
             self._update_node_bandwidth(source_node_id)
             self._update_node_bandwidth(target_node_id)
+            self._maybe_expand_cluster(source_node_id)
+            self._maybe_expand_cluster(target_node_id)
             return
 
         capacity = self._link_capacity(source_node_id, target_node_id)
@@ -307,6 +468,8 @@ class StorageVirtualNetwork:
 
         self._update_node_bandwidth(source_node_id)
         self._update_node_bandwidth(target_node_id)
+        self._maybe_expand_cluster(source_node_id)
+        self._maybe_expand_cluster(target_node_id)
 
     def _update_node_bandwidth(self, node_id: str) -> None:
         node = self.nodes.get(node_id)

@@ -7,6 +7,7 @@ A lightweight simulator that models storage nodes, their network interconnects, 
 - **Simulator**: Drives discrete events and enforces execution order based on absolute time.
 - **StorageVirtualNetwork**: Shares link bandwidth across concurrent transfers using a configurable tick interval so chunks progress fairly.
 - **StorageVirtualNode**: Captures compute, memory, storage, and link characteristics for each simulated endpoint.
+- **Demand Scaling**: A decentralized policy that lets any saturated node spawn replicas and extend the topology without a central coordinator.
 
 ## Running the Test Suite
 
@@ -20,10 +21,16 @@ cd "C:/Users/USER PRO/nexusAI/NEXUSAI-ENTERPRISES"
 The suite currently includes:
 
 - `tests/test_simulator.py`: Ensures the event scheduler respects absolute times and priority ordering.
-- `tests/test_storage_network.py`: Verifies that concurrent transfers share bandwidth (each completes within 10% of the other) and run slower than a solo transfer.
+- `tests/test_storage_network.py`: Covers bandwidth fairness plus decentralized demand scaling (replicas appear once hot targets exceed storage or bandwidth thresholds).
 
 ## Bandwidth-Sharing Expectations
 
 - When a link has multiple active transfers, each transfer receives an equal share of the link bandwidth during every tick.
 - Transfers that cannot obtain bandwidth fail fast rather than stalling indefinitely.
 - Regression tests assert both the slowdown (relative to single-transfer runs) and fairness between concurrent transfers. Adjust the tick interval or tolerances if you change the sharing algorithm.
+
+## Demand-Driven Scaling
+
+- Each node belongs to a replica cluster; any member that approaches configurable storage/bandwidth thresholds can clone itself, inheriting connections from its parent and creating a new path for traffic.
+- Replica creation is entirely event-driven—no global controller exists—so saturation on one link or node results in local growth instead of centralized orchestration.
+- `DemandScalingConfig` lets you tune utilization thresholds, replica limits, and resource multipliers; see `tests/test_storage_network.py::test_demand_scaling_spawns_replicas_for_hot_targets` for an example harness.
