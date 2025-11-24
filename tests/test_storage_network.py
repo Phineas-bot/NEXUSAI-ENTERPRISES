@@ -119,3 +119,29 @@ def test_demand_scaling_spawns_replicas_for_hot_targets():
 
     for transfer in transfers:
         assert transfer.status == TransferStatus.COMPLETED
+
+
+def test_multi_hop_routing_selects_lowest_latency_path():
+    sim = Simulator()
+    network = StorageVirtualNetwork(sim, tick_interval=0.005)
+
+    node_a = StorageVirtualNode("node-a", 4, 16, 500, BANDWIDTH_MBPS)
+    node_b = StorageVirtualNode("node-b", 4, 16, 500, BANDWIDTH_MBPS)
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    node_d = StorageVirtualNode("node-d", 4, 16, 500, BANDWIDTH_MBPS)
+
+    for node in (node_a, node_b, node_c, node_d):
+        network.add_node(node)
+
+    network.connect_nodes("node-a", "node-b", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-b", "node-c", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-a", "node-d", bandwidth=500, latency_ms=5.0)
+    network.connect_nodes("node-d", "node-c", bandwidth=500, latency_ms=5.0)
+
+    transfer = network.initiate_file_transfer("node-a", "node-c", "multi-hop.bin", 50 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run()
+
+    assert transfer.status == TransferStatus.COMPLETED
+    assert network.get_route("node-a", "node-c") == ["node-a", "node-b", "node-c"]

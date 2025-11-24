@@ -5,6 +5,8 @@ from typing import Dict, List, Optional, Union
 from enum import Enum, auto
 import hashlib
 
+from virtual_disk import VirtualDisk
+
 class TransferStatus(Enum):
     PENDING = auto()
     IN_PROGRESS = auto()
@@ -43,12 +45,13 @@ class StorageVirtualNode:
         self.memory_capacity = memory_capacity
         self.total_storage = storage_capacity * 1024 * 1024 * 1024  # Convert GB to bytes
         self.bandwidth = bandwidth * 1000000  # Convert Mbps to bits per second
+        self.ip_address: Optional[str] = None
         
         # Current utilization
-        self.used_storage = 0
         self.active_transfers: Dict[str, FileTransfer] = {}
         self.stored_files: Dict[str, FileTransfer] = {}
         self.network_utilization = 0  # Current bandwidth usage
+        self.disk = VirtualDisk(self.total_storage)
         
         # Performance metrics
         self.total_requests_processed = 0
@@ -117,9 +120,8 @@ class StorageVirtualNode:
         source_node: Optional[str] = None
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
-        # Check if we have enough storage space
-        projected_usage = self.used_storage + sum(t.total_size for t in self.active_transfers.values())
-        if projected_usage + file_size > self.total_storage:
+        # Reserve disk capacity ahead of time so transfers cannot overcommit storage
+        if not self.disk.reserve_file(file_id, file_size):
             return None
         
         # Create file transfer record
@@ -157,6 +159,12 @@ class StorageVirtualNode:
         # Update chunk status
         chunk.status = TransferStatus.COMPLETED
         chunk.stored_node = self.node_id
+
+        try:
+            self.disk.write_chunk(file_id, chunk_id, data=None, expected_size=chunk.size)
+        except (ValueError, KeyError):
+            self.abort_transfer(file_id)
+            return False
         
         # Update metrics
         transfer.status = TransferStatus.IN_PROGRESS
@@ -166,12 +174,19 @@ class StorageVirtualNode:
         if all(c.status == TransferStatus.COMPLETED for c in transfer.chunks):
             transfer.status = TransferStatus.COMPLETED
             transfer.completed_at = completed_time
-            self.used_storage += transfer.total_size
             self.stored_files[file_id] = transfer
             del self.active_transfers[file_id]
             self.total_requests_processed += 1
         
         return True
+
+    def abort_transfer(self, file_id: str) -> None:
+        """Abort an in-flight transfer and reclaim its reserved disk space."""
+        transfer = self.active_transfers.pop(file_id, None)
+        if transfer:
+            transfer.status = TransferStatus.FAILED
+            self.failed_transfers += 1
+        self.disk.release_file(file_id)
 
     def retrieve_file(
         self,
@@ -202,15 +217,24 @@ class StorageVirtualNode:
         
         return new_transfer
 
+    @property
+    def used_storage(self) -> int:
+        return self.disk.used_bytes
+
+    @property
+    def projected_storage_usage(self) -> int:
+        return self.disk.used_bytes + self.disk.reserved_bytes
+
     def get_storage_utilization(self) -> Dict[str, Union[int, float, List[str]]]:
         """Get current storage utilization metrics"""
+        utilization = (self.disk.used_bytes / self.total_storage) * 100 if self.total_storage else 0.0
         return {
-            "used_bytes": self.used_storage,  # int
-            "total_bytes": self.total_storage,  # int
-            "utilization_percent": (self.used_storage / self.total_storage) * 100,  # float
-            "files_stored": len(self.stored_files),  # int
-            "active_transfers": len(self.active_transfers)  # int
-            # Note: Removed list[str] since the current implementation doesn't return any lists
+            "used_bytes": self.disk.used_bytes,
+            "reserved_bytes": self.disk.reserved_bytes,
+            "total_bytes": self.total_storage,
+            "utilization_percent": utilization,
+            "files_stored": len(self.stored_files),
+            "active_transfers": len(self.active_transfers),
         }
 
     def get_network_utilization(self) -> Dict[str, Union[int, float, List[str]]]:

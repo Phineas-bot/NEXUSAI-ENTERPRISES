@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import hashlib
 from collections import defaultdict
+import heapq
 
 from storage_virtual_node import (
     StorageVirtualNode,
@@ -23,6 +24,14 @@ class ActiveChunk:
     transfer: FileTransfer
     chunk: FileChunk
     remaining_bytes: float
+    path: List[str]
+    hop_index: int = 0
+
+    def current_hop_nodes(self) -> Tuple[str, str]:
+        return self.path[self.hop_index], self.path[self.hop_index + 1]
+
+    def on_last_hop(self) -> bool:
+        return self.hop_index >= len(self.path) - 2
 
 @dataclass
 class DemandScalingConfig:
@@ -58,17 +67,25 @@ class StorageVirtualNetwork:
         # Replica/cluster bookkeeping for decentralized scaling
         self.node_roots: Dict[str, str] = {}
         self.cluster_nodes: Dict[str, Set[str]] = defaultdict(set)
+
+        # Network topology and addressing
+        self.link_latency_ms: Dict[Tuple[str, str], float] = {}
+        self._ip_counter = 1
         
     def add_node(self, node: StorageVirtualNode, root_id: Optional[str] = None):
         """Add a node to the network"""
+        if not getattr(node, "ip_address", None):
+            node.ip_address = self._allocate_ip()
         self.nodes[node.node_id] = node
         self._register_node_cluster(node.node_id, root_id)
         
-    def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int):
-        """Connect two nodes with specified bandwidth"""
+    def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
+        """Connect two nodes with specified bandwidth and latency"""
         if node1_id in self.nodes and node2_id in self.nodes:
             self.nodes[node1_id].add_connection(node2_id, bandwidth)
             self.nodes[node2_id].add_connection(node1_id, bandwidth)
+            self.link_latency_ms[(node1_id, node2_id)] = latency_ms
+            self.link_latency_ms[(node2_id, node1_id)] = latency_ms
             return True
         return False
     
@@ -86,6 +103,11 @@ class StorageVirtualNetwork:
         effective_target_id = self._ensure_target_capacity(target_node_id, file_size)
         if not effective_target_id:
             return None
+
+        route = self._compute_route(source_node_id, effective_target_id)
+        if not route or route[-1] != effective_target_id:
+            return None
+
         target_node = self.nodes[effective_target_id]
         self._maybe_expand_cluster(effective_target_id)
             
@@ -117,7 +139,7 @@ class StorageVirtualNetwork:
 
         if transfer:
             self.transfer_operations[source_node_id][file_id] = transfer
-            self._schedule_next_chunk(source_node_id, effective_target_id, file_id)
+            self._schedule_next_chunk(source_node_id, effective_target_id, file_id, route)
             return transfer
         return None
     
@@ -150,10 +172,20 @@ class StorageVirtualNetwork:
         """Return the cluster (root + replicas) for a given node id."""
         return set(self._get_cluster_nodes(node_id))
 
+    def get_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
+        """Expose the currently computed routing path for testing/inspection."""
+        return self._compute_route(source_node_id, target_node_id)
+
     def _emit_event(self, event_type: str, **payload: Any) -> None:
         event = {"type": event_type, "time": self.simulator.now, **payload}
         for observer in self.transfer_observers:
             observer(event)
+
+    def _allocate_ip(self) -> str:
+        octet = 2 + (self._ip_counter % 250)
+        subnet = self._ip_counter // 250
+        self._ip_counter += 1
+        return f"10.0.{subnet}.{octet}"
 
     def _link_key(self, source_node_id: str, target_node_id: str) -> Tuple[str, str]:
         return (source_node_id, target_node_id)
@@ -170,10 +202,82 @@ class StorageVirtualNetwork:
         )
         return float(min(link_bandwidth, source_node.bandwidth, target_node.bandwidth))
 
+    def _neighbor_links(self, node_id: str) -> List[Tuple[str, float]]:
+        node = self.nodes[node_id]
+        neighbors: List[Tuple[str, float]] = []
+        for neighbor_id in node.connections.keys():
+            if neighbor_id not in self.nodes:
+                continue
+            latency = self.link_latency_ms.get((node_id, neighbor_id), 1.0)
+            neighbors.append((neighbor_id, latency))
+        return neighbors
+
+    def _compute_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
+        if source_node_id == target_node_id:
+            return [source_node_id]
+
+        visited: Set[str] = set()
+        heap: List[Tuple[float, str, Optional[str]]] = [(0.0, source_node_id, None)]
+        parents: Dict[str, Optional[str]] = {}
+
+        while heap:
+            cost, node_id, parent = heapq.heappop(heap)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            parents[node_id] = parent
+            if node_id == target_node_id:
+                break
+            for neighbor_id, latency in self._neighbor_links(node_id):
+                if neighbor_id in visited:
+                    continue
+                heapq.heappush(heap, (cost + latency, neighbor_id, node_id))
+
+        if target_node_id not in parents:
+            return None
+
+        path: List[str] = []
+        current: Optional[str] = target_node_id
+        while current is not None:
+            path.append(current)
+            current = parents.get(current)
+        path.reverse()
+        return path
+
     def _ensure_tick(self) -> None:
         if not self._tick_scheduled:
             self._tick_scheduled = True
             self.simulator.schedule_in(0.0, self._network_tick)
+
+    def _attach_chunk_to_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
+        source, target = state.current_hop_nodes()
+        link_key = self._link_key(source, target)
+        self.link_active_chunks[link_key].add(chunk_key)
+        self.node_active_chunks[source].add(chunk_key)
+        self.node_active_chunks[target].add(chunk_key)
+        self._recalculate_link_share(source, target)
+
+    def _detach_chunk_from_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
+        source, target = state.current_hop_nodes()
+        link_key = self._link_key(source, target)
+        link_chunks = self.link_active_chunks.get(link_key)
+        if link_chunks:
+            link_chunks.discard(chunk_key)
+            if not link_chunks:
+                self.link_active_chunks.pop(link_key, None)
+        for node_id in (source, target):
+            node_chunks = self.node_active_chunks.get(node_id)
+            if node_chunks:
+                node_chunks.discard(chunk_key)
+                if not node_chunks:
+                    self.node_active_chunks.pop(node_id, None)
+            self._update_node_bandwidth(node_id)
+        self._recalculate_link_share(source, target)
+
+    def _advance_chunk_to_next_hop(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
+        self._detach_chunk_from_link(chunk_key, state)
+        state.hop_index += 1
+        self._attach_chunk_to_link(chunk_key, state)
 
     def _register_node_cluster(self, node_id: str, root_id: Optional[str] = None) -> None:
         root = root_id or self.node_roots.get(node_id) or node_id
@@ -200,22 +304,21 @@ class StorageVirtualNetwork:
         if not candidates:
             return None
 
-        def projected_usage(node: StorageVirtualNode) -> float:
-            pending = sum(t.total_size for t in node.active_transfers.values())
-            return node.used_storage + pending
-
         def has_capacity(node: StorageVirtualNode) -> bool:
             if required_size is None:
                 return True
-            return (projected_usage(node) + required_size) <= node.total_storage
+            projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else (node.used_storage + sum(t.total_size for t in node.active_transfers.values()))
+            return (projected + required_size) <= node.total_storage
 
         eligible = [node for node in candidates if has_capacity(node)]
         if not eligible:
             return None
 
-        eligible.sort(
-            key=lambda n: (projected_usage(n) / n.total_storage) if n.total_storage else 0.0
-        )
+        def projected_usage_ratio(node: StorageVirtualNode) -> float:
+            projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else (node.used_storage + sum(t.total_size for t in node.active_transfers.values()))
+            return (projected / node.total_storage) if node.total_storage else 0.0
+
+        eligible.sort(key=projected_usage_ratio)
         return eligible[0].node_id
 
     def _ensure_target_capacity(self, requested_node_id: str, file_size: int) -> Optional[str]:
@@ -270,7 +373,8 @@ class StorageVirtualNetwork:
     def _is_node_overloaded(self, node: StorageVirtualNode) -> bool:
         if not self.scaling.enabled:
             return False
-        storage_ratio = (node.used_storage / node.total_storage) if node.total_storage else 0.0
+        projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else node.used_storage
+        storage_ratio = (projected / node.total_storage) if node.total_storage else 0.0
         bandwidth_ratio = (node.network_utilization / node.bandwidth) if node.bandwidth else 0.0
         return (
             storage_ratio >= self.scaling.storage_utilization_threshold
@@ -290,7 +394,13 @@ class StorageVirtualNetwork:
         overloaded.sort(key=lambda n: n.network_utilization, reverse=True)
         self._spawn_replica_node(overloaded[0].node_id)
 
-    def _schedule_next_chunk(self, source_node_id: str, target_node_id: str, file_id: str) -> None:
+    def _schedule_next_chunk(
+        self,
+        source_node_id: str,
+        target_node_id: str,
+        file_id: str,
+        route: Optional[List[str]] = None,
+    ) -> None:
         transfer = self.transfer_operations[source_node_id].get(file_id)
         if not transfer:
             return
@@ -298,6 +408,20 @@ class StorageVirtualNetwork:
         next_chunk = next((c for c in transfer.chunks if c.status != TransferStatus.COMPLETED), None)
         if not next_chunk:
             self._finalize_transfer(source_node_id, target_node_id, file_id, transfer)
+            return
+
+        path = route or self._compute_route(source_node_id, target_node_id)
+        if not path or len(path) < 2:
+            transfer.status = TransferStatus.FAILED
+            self._emit_event(
+                "transfer_failed",
+                file_id=file_id,
+                source=source_node_id,
+                target=target_node_id,
+                reason="No available route",
+            )
+            self.transfer_operations[source_node_id].pop(file_id, None)
+            self.nodes[target_node_id].abort_transfer(file_id)
             return
 
         if self._link_capacity(source_node_id, target_node_id) <= 0:
@@ -310,6 +434,9 @@ class StorageVirtualNetwork:
                 reason="No available bandwidth",
             )
             self.transfer_operations[source_node_id].pop(file_id, None)
+            target_node = self.nodes.get(target_node_id)
+            if target_node:
+                target_node.abort_transfer(file_id)
             return
 
         chunk_key = self._chunk_key(source_node_id, target_node_id, file_id, next_chunk.chunk_id)
@@ -322,17 +449,16 @@ class StorageVirtualNetwork:
             transfer=transfer,
             chunk=next_chunk,
             remaining_bytes=float(next_chunk.size),
+            path=path,
         )
 
         self.active_chunks[chunk_key] = state
-        self.link_active_chunks[self._link_key(source_node_id, target_node_id)].add(chunk_key)
-        self.node_active_chunks[source_node_id].add(chunk_key)
-        self.node_active_chunks[target_node_id].add(chunk_key)
+        self.chunk_bandwidths[chunk_key] = 0.0
+        self._attach_chunk_to_link(chunk_key, state)
 
         next_chunk.status = TransferStatus.IN_PROGRESS
         transfer.status = TransferStatus.IN_PROGRESS
 
-        self._recalculate_link_share(source_node_id, target_node_id)
         self._ensure_tick()
 
     def _network_tick(self) -> None:
@@ -346,12 +472,15 @@ class StorageVirtualNetwork:
         for chunk_key, state in list(self.active_chunks.items()):
             share = self.chunk_bandwidths.get(chunk_key, 0.0)
             if share <= 0:
-                completed.append((chunk_key, False, "No available bandwidth"))
                 continue
 
             bytes_transferred = share * self.tick_interval / 8
             state.remaining_bytes -= bytes_transferred
-            if state.remaining_bytes <= 0:
+            while state.remaining_bytes <= 0 and not state.on_last_hop():
+                overflow = -state.remaining_bytes
+                self._advance_chunk_to_next_hop(chunk_key, state)
+                state.remaining_bytes = float(state.chunk.size) - overflow
+            if state.remaining_bytes <= 0 and state.on_last_hop():
                 completed.append((chunk_key, True, None))
 
         for chunk_key, success, reason in completed:
@@ -391,6 +520,7 @@ class StorageVirtualNetwork:
                 reason="Chunk processing failed",
             )
             self.transfer_operations[state.source].pop(state.transfer.file_id, None)
+            target_node.abort_transfer(state.transfer.file_id)
             return
 
         self._emit_event(
@@ -421,27 +551,14 @@ class StorageVirtualNetwork:
             reason=reason or "Transfer failed",
         )
         self.transfer_operations[state.source].pop(state.transfer.file_id, None)
+        target_node = self.nodes.get(state.target)
+        if target_node:
+            target_node.abort_transfer(state.transfer.file_id)
 
     def _remove_chunk_state(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
-        link_key = self._link_key(state.source, state.target)
+        self._detach_chunk_from_link(chunk_key, state)
         self.active_chunks.pop(chunk_key, None)
         self.chunk_bandwidths.pop(chunk_key, None)
-
-        link_chunks = self.link_active_chunks.get(link_key)
-        if link_chunks:
-            link_chunks.discard(chunk_key)
-            if not link_chunks:
-                self.link_active_chunks.pop(link_key, None)
-
-        for node_id in (state.source, state.target):
-            node_chunks = self.node_active_chunks.get(node_id)
-            if node_chunks:
-                node_chunks.discard(chunk_key)
-                if not node_chunks:
-                    self.node_active_chunks.pop(node_id, None)
-            self._update_node_bandwidth(node_id)
-
-        self._recalculate_link_share(state.source, state.target)
 
     def _recalculate_all_link_shares(self) -> None:
         for source_node_id, target_node_id in list(self.link_active_chunks.keys()):

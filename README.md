@@ -7,6 +7,7 @@ A lightweight simulator that models storage nodes, their network interconnects, 
 - **Simulator**: Drives discrete events and enforces execution order based on absolute time.
 - **StorageVirtualNetwork**: Shares link bandwidth across concurrent transfers using a configurable tick interval so chunks progress fairly.
 - **StorageVirtualNode**: Captures compute, memory, storage, and link characteristics for each simulated endpoint.
+- **VirtualDisk**: Provides block-level storage reservations, chunk persistence, and capacity accounting so nodes manage real data instead of counters.
 - **Demand Scaling**: A decentralized policy that lets any saturated node spawn replicas and extend the topology without a central coordinator.
 
 ## Running the Test Suite
@@ -22,6 +23,7 @@ The suite currently includes:
 
 - `tests/test_simulator.py`: Ensures the event scheduler respects absolute times and priority ordering.
 - `tests/test_storage_network.py`: Covers bandwidth fairness plus decentralized demand scaling (replicas appear once hot targets exceed storage or bandwidth thresholds).
+- `tests/test_virtual_disk.py`: Validates disk reservations, chunk commits, and capacity reclamation logic.
 
 ## Bandwidth-Sharing Expectations
 
@@ -34,3 +36,9 @@ The suite currently includes:
 - Each node belongs to a replica cluster; any member that approaches configurable storage/bandwidth thresholds can clone itself, inheriting connections from its parent and creating a new path for traffic.
 - Replica creation is entirely event-driven—no global controller exists—so saturation on one link or node results in local growth instead of centralized orchestration.
 - `DemandScalingConfig` lets you tune utilization thresholds, replica limits, and resource multipliers; see `tests/test_storage_network.py::test_demand_scaling_spawns_replicas_for_hot_targets` for an example harness.
+
+## Disk-Backed Storage
+
+- Every `StorageVirtualNode` mounts a `VirtualDisk` so transfers reserve space before they begin and persist chunk data as it arrives.
+- Disk usage metrics distinguish committed bytes from reserved-but-not-yet-written space, preventing overcommit and enabling smarter placement decisions.
+- Aborted transfers automatically release their reservations, while successful transfers retain their on-disk chunks for later retrieval or replication.
