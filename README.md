@@ -8,6 +8,7 @@ A lightweight simulator that models storage nodes, their network interconnects, 
 - **StorageVirtualNetwork**: Shares link bandwidth across concurrent transfers using a configurable tick interval so chunks progress fairly.
 - **StorageVirtualNode**: Captures compute, memory, storage, and link characteristics for each simulated endpoint.
 - **VirtualDisk**: Provides block-level storage reservations, chunk persistence, and capacity accounting so nodes manage real data instead of counters.
+- **Routing Engine**: Assigns IPs automatically, builds per-node routing tables via a latency-aware link-state algorithm, and drives multi-hop chunk forwarding with per-hop bandwidth sharing.
 - **Demand Scaling**: A decentralized policy that lets any saturated node spawn replicas and extend the topology without a central coordinator.
 
 ## Running the Test Suite
@@ -22,7 +23,7 @@ cd "C:/Users/USER PRO/nexusAI/NEXUSAI-ENTERPRISES"
 The suite currently includes:
 
 - `tests/test_simulator.py`: Ensures the event scheduler respects absolute times and priority ordering.
-- `tests/test_storage_network.py`: Covers bandwidth fairness plus decentralized demand scaling (replicas appear once hot targets exceed storage or bandwidth thresholds).
+- `tests/test_storage_network.py`: Covers bandwidth fairness, decentralized demand scaling, and multi-hop routing (includes assertions that the lowest latency path is chosen).
 - `tests/test_virtual_disk.py`: Validates disk reservations, chunk commits, and capacity reclamation logic.
 
 ## Bandwidth-Sharing Expectations
@@ -42,3 +43,10 @@ The suite currently includes:
 - Every `StorageVirtualNode` mounts a `VirtualDisk` so transfers reserve space before they begin and persist chunk data as it arrives.
 - Disk usage metrics distinguish committed bytes from reserved-but-not-yet-written space, preventing overcommit and enabling smarter placement decisions.
 - Aborted transfers automatically release their reservations, while successful transfers retain their on-disk chunks for later retrieval or replication.
+
+## Routing & IP Simulation
+
+- `StorageVirtualNetwork` automatically assigns `10.0.x.y` addresses to nodes and tracks per-link latency and bandwidth metrics.
+- A link-state shortest-path algorithm (Dijkstra) computes end-to-end routes; transfers that lack a route fail fast, and tests can introspect the chosen path via `StorageVirtualNetwork.get_route`.
+- Each chunk traverses every hop in its route, sharing bandwidth per link; excess capacity on one hop immediately advances the chunk to the next hop, so pipelines form naturally.
+- Latency metrics propagate when replica nodes spawn, ensuring new links integrate seamlessly with the routing fabric.

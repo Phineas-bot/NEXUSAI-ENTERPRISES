@@ -82,8 +82,8 @@ class StorageVirtualNetwork:
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
         """Connect two nodes with specified bandwidth and latency"""
         if node1_id in self.nodes and node2_id in self.nodes:
-            self.nodes[node1_id].add_connection(node2_id, bandwidth)
-            self.nodes[node2_id].add_connection(node1_id, bandwidth)
+            self.nodes[node1_id].add_connection(node2_id, bandwidth, latency_ms)
+            self.nodes[node2_id].add_connection(node1_id, bandwidth, latency_ms)
             self.link_latency_ms[(node1_id, node2_id)] = latency_ms
             self.link_latency_ms[(node2_id, node1_id)] = latency_ms
             return True
@@ -364,10 +364,11 @@ class StorageVirtualNetwork:
             if neighbor_id not in self.nodes:
                 continue
             bandwidth_mbps = max(1, int(bandwidth_bps / 1000000))
-            self.connect_nodes(replica_id, neighbor_id, bandwidth=bandwidth_mbps)
+            latency = reference_node.get_link_latency(neighbor_id)
+            self.connect_nodes(replica_id, neighbor_id, bandwidth=bandwidth_mbps, latency_ms=latency)
 
         parent_link_bandwidth = max(1, int(reference_node.bandwidth / 1000000))
-        self.connect_nodes(replica_id, reference_node.node_id, bandwidth=parent_link_bandwidth)
+        self.connect_nodes(replica_id, reference_node.node_id, bandwidth=parent_link_bandwidth, latency_ms=1.0)
         return replica_id
 
     def _is_node_overloaded(self, node: StorageVirtualNode) -> bool:
@@ -421,10 +422,13 @@ class StorageVirtualNetwork:
                 reason="No available route",
             )
             self.transfer_operations[source_node_id].pop(file_id, None)
-            self.nodes[target_node_id].abort_transfer(file_id)
+            target_node = self.nodes.get(target_node_id)
+            if target_node:
+                target_node.abort_transfer(file_id)
             return
 
-        if self._link_capacity(source_node_id, target_node_id) <= 0:
+        first_hop_source, first_hop_target = path[0], path[1]
+        if self._link_capacity(first_hop_source, first_hop_target) <= 0:
             transfer.status = TransferStatus.FAILED
             self._emit_event(
                 "transfer_failed",

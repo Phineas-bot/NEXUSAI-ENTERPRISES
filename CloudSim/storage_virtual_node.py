@@ -1,6 +1,6 @@
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 from enum import Enum, auto
 import hashlib
@@ -31,6 +31,15 @@ class FileTransfer:
     created_at: float = 0.0
     completed_at: Optional[float] = None
 
+@dataclass
+class NetworkInterface:
+    name: str
+    ip_address: Optional[str] = None
+    subnet: Optional[str] = None
+    mac_address: Optional[str] = None
+    metrics: Dict[str, Union[int, float]] = field(default_factory=dict)
+
+
 class StorageVirtualNode:
     def __init__(
         self,
@@ -46,6 +55,8 @@ class StorageVirtualNode:
         self.total_storage = storage_capacity * 1024 * 1024 * 1024  # Convert GB to bytes
         self.bandwidth = bandwidth * 1000000  # Convert Mbps to bits per second
         self.ip_address: Optional[str] = None
+        self.network_interfaces: Dict[str, NetworkInterface] = {}
+        self.link_latencies: Dict[str, float] = {}
         
         # Current utilization
         self.active_transfers: Dict[str, FileTransfer] = {}
@@ -61,9 +72,32 @@ class StorageVirtualNode:
         # Network connections (node_id: bandwidth_available)
         self.connections: Dict[str, int] = {}
 
-    def add_connection(self, node_id: str, bandwidth: int):
+    def add_connection(self, node_id: str, bandwidth: int, latency_ms: float = 0.0):
         """Add a network connection to another node"""
         self.connections[node_id] = bandwidth * 1000000  # Store in bits per second
+        self.link_latencies[node_id] = max(0.0, latency_ms)
+
+    def get_link_latency(self, node_id: str) -> float:
+        return self.link_latencies.get(node_id, 0.0)
+
+    def set_ip_address(self, ip_address: str) -> None:
+        self.ip_address = ip_address
+
+    def add_interface(
+        self,
+        name: str,
+        ip_address: Optional[str] = None,
+        subnet: Optional[str] = None,
+        mac_address: Optional[str] = None,
+    ) -> NetworkInterface:
+        iface = NetworkInterface(name=name, ip_address=ip_address, subnet=subnet, mac_address=mac_address)
+        self.network_interfaces[name] = iface
+        if ip_address and not self.ip_address:
+            self.ip_address = ip_address
+        return iface
+
+    def get_interface(self, name: str) -> Optional[NetworkInterface]:
+        return self.network_interfaces.get(name)
 
     def clone(
         self,
