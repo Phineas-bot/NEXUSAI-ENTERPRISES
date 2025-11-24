@@ -42,6 +42,8 @@ class DemandScalingConfig:
     max_replicas_per_root: int = 3
     replica_storage_factor: float = 1.0
     replica_bandwidth_factor: float = 1.0
+    os_failure_threshold: Optional[int] = None
+    os_memory_utilization_threshold: Optional[float] = None
 
 
 class StorageVirtualNetwork:
@@ -72,6 +74,7 @@ class StorageVirtualNetwork:
         # Network topology and addressing
         self.link_latency_ms: Dict[Tuple[str, str], float] = {}
         self._ip_counter = 1
+        self._os_failure_baseline: Dict[str, int] = defaultdict(int)
         
     def add_node(self, node: StorageVirtualNode, root_id: Optional[str] = None):
         """Add a node to the network"""
@@ -79,6 +82,7 @@ class StorageVirtualNetwork:
             node.ip_address = self._allocate_ip()
         self.nodes[node.node_id] = node
         self._register_node_cluster(node.node_id, root_id)
+        self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
         
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
         """Connect two nodes with specified bandwidth and latency"""
@@ -383,10 +387,29 @@ class StorageVirtualNetwork:
         projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else node.used_storage
         storage_ratio = (projected / node.total_storage) if node.total_storage else 0.0
         bandwidth_ratio = (node.network_utilization / node.bandwidth) if node.bandwidth else 0.0
-        return (
-            storage_ratio >= self.scaling.storage_utilization_threshold
-            or bandwidth_ratio >= self.scaling.bandwidth_utilization_threshold
+        os_memory_ratio = (
+            node.virtual_os.used_memory / node.memory_capacity_bytes
+            if getattr(node, "memory_capacity_bytes", 0) else 0.0
         )
+
+        if storage_ratio >= self.scaling.storage_utilization_threshold:
+            return True
+        if bandwidth_ratio >= self.scaling.bandwidth_utilization_threshold:
+            return True
+        if (
+            self.scaling.os_memory_utilization_threshold is not None
+            and os_memory_ratio >= self.scaling.os_memory_utilization_threshold
+        ):
+            return True
+
+        if self.scaling.os_failure_threshold is not None:
+            baseline = self._os_failure_baseline.get(node.node_id, 0)
+            recent_failures = node.os_process_failures - baseline
+            if recent_failures >= self.scaling.os_failure_threshold:
+                self._os_failure_baseline[node.node_id] = node.os_process_failures
+                return True
+
+        return False
 
     def _maybe_expand_cluster(self, node_id: str) -> None:
         if not self.scaling.enabled or node_id not in self.nodes:

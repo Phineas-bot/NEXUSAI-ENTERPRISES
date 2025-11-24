@@ -212,3 +212,61 @@ def test_disk_failures_increment_os_process_counters():
         assert target_node.os_process_failures >= 1
     finally:
         target_node.disk.write_chunk = original_write
+
+
+def test_retrieve_file_uses_virtual_os_and_handles_failures():
+    node = StorageVirtualNode("node-x", cpu_capacity=4, memory_capacity=8, storage_capacity=50, bandwidth=100)
+
+    transfer = node.initiate_file_transfer("file-1", "data.bin", 5 * 1024 * 1024, current_time=0.0, source_node="client")
+    assert transfer is not None
+
+    for chunk in transfer.chunks:
+        assert node.process_chunk_transfer("file-1", chunk.chunk_id, "client", completed_time=0.0, bandwidth_used_bps=1_000_000)
+
+    original_read = node.disk.read_chunk
+
+    def failing_read(self, file_id: str, chunk_id: int):
+        raise RuntimeError("disk offline")
+
+    node.disk.read_chunk = types.MethodType(failing_read, node.disk)
+    try:
+        retrieval = node.retrieve_file("file-1", "node-y")
+        assert retrieval is None
+        assert node.os_process_failures >= 1
+    finally:
+        node.disk.read_chunk = original_read
+
+    retrieval = node.retrieve_file("file-1", "node-y")
+    assert retrieval is not None
+    assert retrieval.is_retrieval is True
+    assert retrieval.backing_file_id == "file-1"
+
+
+def test_demand_scaling_triggers_on_os_failures():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        storage_utilization_threshold=0.99,
+        bandwidth_utilization_threshold=0.99,
+        os_failure_threshold=1,
+    )
+
+    sim, network = _build_network(scaling_config=scaling)
+    target_node = network.nodes["node-b"]
+
+    original_write = target_node.disk.write_chunk
+
+    def failing_write(self, *args, **kwargs):
+        raise RuntimeError("disk offline")
+
+    target_node.disk.write_chunk = types.MethodType(failing_write, target_node.disk)
+
+    try:
+        transfer = network.initiate_file_transfer("node-a", "node-b", "os-scale.bin", 20 * 1024 * 1024)
+        assert transfer is not None
+        sim.run()
+    finally:
+        target_node.disk.write_chunk = original_write
+
+    assert network.nodes["node-b"].os_process_failures >= 1
+    cluster_nodes = network.get_cluster_nodes("node-b")
+    assert len(cluster_nodes) >= 2

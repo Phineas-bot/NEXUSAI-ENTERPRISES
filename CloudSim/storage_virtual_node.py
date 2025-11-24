@@ -31,6 +31,12 @@ class FileTransfer:
     status: TransferStatus = TransferStatus.PENDING
     created_at: float = 0.0
     completed_at: Optional[float] = None
+    is_retrieval: bool = False
+    backing_file_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.backing_file_id is None:
+            self.backing_file_id = self.file_id
 
 @dataclass
 class NetworkInterface:
@@ -247,6 +253,17 @@ class StorageVirtualNode:
             return None
         
         file_transfer = self.stored_files[file_id]
+
+        for chunk in file_transfer.chunks:
+            def read_chunk(chunk_id=chunk.chunk_id):
+                self.disk.read_chunk(file_id, chunk_id)
+
+            if not self._execute_chunk_process(
+                chunk.size,
+                purpose="egress-read",
+                work=read_chunk,
+            ):
+                return None
         
         # Create a new transfer record for the retrieval
         new_transfer = FileTransfer(
@@ -261,7 +278,10 @@ class StorageVirtualNode:
                     stored_node=destination_node
                 )
                 for c in file_transfer.chunks
-            ]
+            ],
+            is_retrieval=True,
+            backing_file_id=file_id,
+            created_at=time.time(),
         )
         
         return new_transfer
