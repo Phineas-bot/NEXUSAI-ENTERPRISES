@@ -11,6 +11,7 @@ A lightweight simulator that models storage nodes, their network interconnects, 
 - **VirtualDisk**: Provides block-level storage reservations, chunk persistence, and capacity accounting so nodes manage real data instead of counters.
 - **Routing Engine**: Assigns IPs automatically, builds per-node routing tables via a latency-aware link-state algorithm, and drives multi-hop chunk forwarding with per-hop bandwidth sharing.
 - **Demand Scaling**: A decentralized policy that lets any saturated node spawn replicas and extend the topology without a central coordinator.
+- **Replica Transfers**: `StorageVirtualNetwork.initiate_replica_transfer` reuses stored data, driving disk reads through each node's VirtualOS so replicas receive consistent chunks without pre-reading entire files.
 
 ## Running the Test Suite
 
@@ -62,3 +63,4 @@ The suite currently includes:
 - Nodes surface OS health in `get_performance_metrics()` (used memory + failure counters) so scaling policies can consider compute pressure alongside storage and bandwidth.
 - Disk operations run as VirtualOS processes as well; when `VirtualDisk.write_chunk` raises, the owning node increments `os_process_failures`, and transfers fail deterministically (`tests/test_storage_network.py::test_disk_failures_increment_os_process_counters`).
 - Demand scaling now inspects OS pressure: configure `os_failure_threshold` (spawns replicas after N recent process failures) and `os_memory_utilization_threshold` (replicates when RAM pressure stays high) in `DemandScalingConfig` to keep hot nodes from thrashing their virtual kernels.
+- Use `StorageVirtualNetwork.initiate_replica_transfer(owner_node_id, target_node_id, file_id)` to clone stored data across the network. Each chunk read is scheduled via `prepare_chunk_read`, so replication respects CPU/RAM budgets and bubbles up disk read failures just like ingestion (`tests/test_storage_network.py::test_replica_transfer_streams_chunks_via_virtual_os`).

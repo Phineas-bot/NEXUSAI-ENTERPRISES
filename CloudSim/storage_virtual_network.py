@@ -147,6 +147,44 @@ class StorageVirtualNetwork:
             self._schedule_next_chunk(source_node_id, effective_target_id, file_id, route)
             return transfer
         return None
+
+    def initiate_replica_transfer(
+        self,
+        owner_node_id: str,
+        target_node_id: str,
+        file_id: str,
+    ) -> Optional[FileTransfer]:
+        if owner_node_id not in self.nodes or target_node_id not in self.nodes:
+            return None
+
+        route = self._compute_route(owner_node_id, target_node_id)
+        if not route or len(route) < 2:
+            return None
+
+        source_node = self.nodes[owner_node_id]
+        retrieval = source_node.retrieve_file(file_id, target_node_id)
+        if not retrieval:
+            return None
+
+        target_node = self.nodes[target_node_id]
+        transfer = target_node.initiate_file_transfer(
+            retrieval.file_id,
+            retrieval.file_name,
+            retrieval.total_size,
+            current_time=self.simulator.now,
+            source_node=owner_node_id,
+        )
+        if not transfer:
+            return None
+
+        transfer.chunks = retrieval.chunks
+        transfer.is_retrieval = True
+        transfer.backing_file_id = file_id
+        transfer.created_at = self.simulator.now
+
+        self.transfer_operations[owner_node_id][transfer.file_id] = transfer
+        self._schedule_next_chunk(owner_node_id, target_node_id, transfer.file_id, route)
+        return transfer
     
     def get_network_stats(self) -> Dict[str, float]:
         """Get overall network statistics"""
@@ -600,6 +638,9 @@ class StorageVirtualNetwork:
         node = self.nodes.get(source)
         if not node:
             return False
+        if state.hop_index == 0 and state.transfer.is_retrieval:
+            if not node.prepare_chunk_read(state.transfer, state.chunk):
+                return False
         pid = node.start_chunk_transmission(state.chunk.size)
         if pid is None:
             return False

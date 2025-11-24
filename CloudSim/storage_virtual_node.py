@@ -253,21 +253,10 @@ class StorageVirtualNode:
             return None
         
         file_transfer = self.stored_files[file_id]
+        timestamp = time.time()
 
-        for chunk in file_transfer.chunks:
-            def read_chunk(chunk_id=chunk.chunk_id):
-                self.disk.read_chunk(file_id, chunk_id)
-
-            if not self._execute_chunk_process(
-                chunk.size,
-                purpose="egress-read",
-                work=read_chunk,
-            ):
-                return None
-        
-        # Create a new transfer record for the retrieval
-        new_transfer = FileTransfer(
-            file_id=f"retr-{file_id}-{time.time()}",
+        return FileTransfer(
+            file_id=f"retr-{file_id}-{timestamp}",
             file_name=file_transfer.file_name,
             total_size=file_transfer.total_size,
             chunks=[
@@ -281,10 +270,8 @@ class StorageVirtualNode:
             ],
             is_retrieval=True,
             backing_file_id=file_id,
-            created_at=time.time(),
+            created_at=timestamp,
         )
-        
-        return new_transfer
 
     @property
     def used_storage(self) -> int:
@@ -361,6 +348,21 @@ class StorageVirtualNode:
         if not self._run_process_to_completion(pid):
             self.virtual_os.kill_process(pid)
             self.os_process_failures += 1
+
+    def prepare_chunk_read(self, transfer: FileTransfer, chunk: FileChunk) -> bool:
+        if not transfer.is_retrieval:
+            return True
+
+        backing_file_id = transfer.backing_file_id or transfer.file_id
+
+        def read_chunk() -> None:
+            self.disk.read_chunk(backing_file_id, chunk.chunk_id)
+
+        return self._execute_chunk_process(
+            chunk.size,
+            purpose="egress-read",
+            work=read_chunk,
+        )
 
     def _execute_chunk_process(
         self,

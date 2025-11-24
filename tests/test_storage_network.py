@@ -214,34 +214,6 @@ def test_disk_failures_increment_os_process_counters():
         target_node.disk.write_chunk = original_write
 
 
-def test_retrieve_file_uses_virtual_os_and_handles_failures():
-    node = StorageVirtualNode("node-x", cpu_capacity=4, memory_capacity=8, storage_capacity=50, bandwidth=100)
-
-    transfer = node.initiate_file_transfer("file-1", "data.bin", 5 * 1024 * 1024, current_time=0.0, source_node="client")
-    assert transfer is not None
-
-    for chunk in transfer.chunks:
-        assert node.process_chunk_transfer("file-1", chunk.chunk_id, "client", completed_time=0.0, bandwidth_used_bps=1_000_000)
-
-    original_read = node.disk.read_chunk
-
-    def failing_read(self, file_id: str, chunk_id: int):
-        raise RuntimeError("disk offline")
-
-    node.disk.read_chunk = types.MethodType(failing_read, node.disk)
-    try:
-        retrieval = node.retrieve_file("file-1", "node-y")
-        assert retrieval is None
-        assert node.os_process_failures >= 1
-    finally:
-        node.disk.read_chunk = original_read
-
-    retrieval = node.retrieve_file("file-1", "node-y")
-    assert retrieval is not None
-    assert retrieval.is_retrieval is True
-    assert retrieval.backing_file_id == "file-1"
-
-
 def test_demand_scaling_triggers_on_os_failures():
     scaling = DemandScalingConfig(
         enabled=True,
@@ -270,3 +242,87 @@ def test_demand_scaling_triggers_on_os_failures():
     assert network.nodes["node-b"].os_process_failures >= 1
     cluster_nodes = network.get_cluster_nodes("node-b")
     assert len(cluster_nodes) >= 2
+
+
+def test_replica_transfer_streams_chunks_via_virtual_os():
+    sim, network = _build_network()
+    seed_transfer = network.initiate_file_transfer("node-a", "node-b", "seed.bin", 50 * 1024 * 1024)
+    assert seed_transfer is not None
+    sim.run()
+
+    node_b = network.nodes["node-b"]
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    network.add_node(node_c)
+    network.connect_nodes("node-b", "node-c", bandwidth=BANDWIDTH_MBPS)
+
+    read_calls = {"count": 0}
+    original_read = node_b.disk.read_chunk
+
+    def counting_read(self, file_id: str, chunk_id: int):
+        read_calls["count"] += 1
+        return original_read(file_id, chunk_id)
+
+    node_b.disk.read_chunk = types.MethodType(counting_read, node_b.disk)
+    try:
+        replica_transfer = network.initiate_replica_transfer("node-b", "node-c", seed_transfer.file_id)
+        assert replica_transfer is not None
+        assert read_calls["count"] == 1  # Only the first chunk should be read eagerly
+
+        sim.run()
+
+        assert read_calls["count"] == len(replica_transfer.chunks)
+        assert replica_transfer.status == TransferStatus.COMPLETED
+        assert replica_transfer.file_id in node_c.stored_files
+    finally:
+        node_b.disk.read_chunk = original_read
+
+
+def test_replica_transfer_handles_disk_read_failures():
+    sim, network = _build_network()
+    seed_transfer = network.initiate_file_transfer("node-a", "node-b", "seed.bin", 10 * 1024 * 1024)
+    assert seed_transfer is not None
+    sim.run()
+
+    node_b = network.nodes["node-b"]
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    network.add_node(node_c)
+    network.connect_nodes("node-b", "node-c", bandwidth=BANDWIDTH_MBPS)
+
+    original_read = node_b.disk.read_chunk
+
+    def failing_read(self, file_id: str, chunk_id: int):
+        raise RuntimeError("disk offline")
+
+    node_b.disk.read_chunk = types.MethodType(failing_read, node_b.disk)
+    try:
+        replica_transfer = network.initiate_replica_transfer("node-b", "node-c", seed_transfer.file_id)
+        assert replica_transfer is not None
+
+        sim.run()
+
+        assert replica_transfer.status == TransferStatus.FAILED
+        assert node_b.os_process_failures >= 1
+        assert replica_transfer.file_id not in node_c.stored_files
+    finally:
+        node_b.disk.read_chunk = original_read
+
+
+def test_demand_scaling_triggers_on_os_memory_pressure():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        storage_utilization_threshold=0.99,
+        bandwidth_utilization_threshold=0.99,
+        os_memory_utilization_threshold=0.01,
+        max_replicas_per_root=2,
+    )
+
+    sim, network = _build_network(scaling_config=scaling)
+    for idx in range(3):
+        transfer = network.initiate_file_transfer("node-a", "node-b", f"mem-{idx}.bin", 150 * 1024 * 1024)
+        assert transfer is not None
+
+    sim.run()
+
+    source_cluster = network.get_cluster_nodes("node-a")
+    target_cluster = network.get_cluster_nodes("node-b")
+    assert len(source_cluster) >= 2 or len(target_cluster) >= 2
