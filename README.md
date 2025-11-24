@@ -45,6 +45,7 @@ The suite currently includes:
 - Every `StorageVirtualNode` mounts a `VirtualDisk` so transfers reserve space before they begin and persist chunk data as it arrives.
 - Disk usage metrics distinguish committed bytes from reserved-but-not-yet-written space, preventing overcommit and enabling smarter placement decisions.
 - Aborted transfers automatically release their reservations, while successful transfers retain their on-disk chunks for later retrieval or replication.
+- Disk writes now execute inside VirtualOS-managed processes, so storage failures surface as OS process errors and consume CPU/RAM budgets just like network activity.
 
 ## Routing & IP Simulation
 
@@ -58,3 +59,4 @@ The suite currently includes:
 - Each chunk ingestion first spawns a short-lived process inside the node’s `VirtualOS`; if CPU or RAM are exhausted the transfer aborts early and releases disk reservations.
 - Network egress also flows through `VirtualOS.start_chunk_transmission`, so oversubscribed senders fail fast rather than silently queueing unlimited traffic. See `tests/test_storage_network.py::test_virtual_os_backpressure_limits_parallel_transmissions` for coverage.
 - Nodes surface OS health in `get_performance_metrics()` (used memory + failure counters) so scaling policies can consider compute pressure alongside storage and bandwidth.
+- Disk operations run as VirtualOS processes as well; when `VirtualDisk.write_chunk` raises, the owning node increments `os_process_failures`, and transfers fail deterministically (`tests/test_storage_network.py::test_disk_failures_increment_os_process_counters`).

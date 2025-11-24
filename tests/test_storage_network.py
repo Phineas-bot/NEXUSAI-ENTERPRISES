@@ -1,4 +1,5 @@
 import sys
+import types
 from pathlib import Path
 from typing import Optional
 
@@ -189,3 +190,25 @@ def test_virtual_os_backpressure_limits_parallel_transmissions():
     assert len(completed) == 1
     assert len(failed) == len(transfers) - 1
     assert network.nodes["node-a"].os_process_failures >= len(failed)
+
+
+def test_disk_failures_increment_os_process_counters():
+    sim, network = _build_network()
+    target_node = network.nodes["node-b"]
+
+    original_write = target_node.disk.write_chunk
+
+    def failing_write(self, *args, **kwargs):
+        raise RuntimeError("disk offline")
+
+    target_node.disk.write_chunk = types.MethodType(failing_write, target_node.disk)
+
+    try:
+        transfer = network.initiate_file_transfer("node-a", "node-b", "disk-fail.bin", 10 * 1024 * 1024)
+        assert transfer is not None
+        sim.run()
+
+        assert transfer.status == TransferStatus.FAILED
+        assert target_node.os_process_failures >= 1
+    finally:
+        target_node.disk.write_chunk = original_write

@@ -58,3 +58,19 @@ def test_block_and_unblock_cycle():
     os.unblock_process(pid)
     drain_scheduler(os)
     assert os.get_process(pid).state == ProcessState.COMPLETED
+
+
+def test_process_target_runs_only_once():
+    os = VirtualOS(cpu_capacity=1, memory_capacity_bytes=32 * 1024 * 1024, cpu_time_slice=0.01)
+    call_counter = {"count": 0}
+
+    def work():
+        call_counter["count"] += 1
+
+    pid = os.spawn_process("disk-io", cpu_required=0.05, memory_required=4 * 1024 * 1024, target=work)
+    assert pid is not None
+
+    drain_scheduler(os)
+
+    assert os.get_process(pid).state == ProcessState.COMPLETED
+    assert call_counter["count"] == 1

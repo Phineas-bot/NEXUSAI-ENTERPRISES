@@ -23,6 +23,7 @@ class VirtualProcess:
     state: ProcessState = ProcessState.READY
     cpu_used: float = 0.0
     failure_reason: Optional[str] = None
+    work_executed: bool = False
 
 
 class VirtualOS:
@@ -79,7 +80,9 @@ class VirtualOS:
         process.state = ProcessState.RUNNING
         cpu_budget = min(self.cpu_time_slice, process.cpu_required - process.cpu_used)
         try:
-            process.target()
+            if not process.work_executed:
+                process.target()
+                process.work_executed = True
             process.cpu_used += cpu_budget
             if process.cpu_used >= process.cpu_required:
                 process.state = ProcessState.COMPLETED

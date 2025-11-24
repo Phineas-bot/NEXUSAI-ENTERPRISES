@@ -1,7 +1,7 @@
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 from enum import Enum, auto
 import hashlib
 
@@ -202,20 +202,18 @@ class StorageVirtualNode:
         except StopIteration:
             return False
         
-        # Update chunk status
-        chunk.status = TransferStatus.COMPLETED
         chunk.stored_node = self.node_id
+        chunk.status = TransferStatus.IN_PROGRESS
 
-        # Simulate CPU/memory consumption through the virtual OS
-        if not self._execute_chunk_process(chunk.size, purpose="ingest"):
-            self.abort_transfer(file_id)
-            return False
-
-        try:
+        def commit_chunk() -> None:
             self.disk.write_chunk(file_id, chunk_id, data=None, expected_size=chunk.size)
-        except (ValueError, KeyError):
+
+        # Simulate CPU/memory consumption through the virtual OS (includes disk commit)
+        if not self._execute_chunk_process(chunk.size, purpose="ingest", work=commit_chunk):
             self.abort_transfer(file_id)
             return False
+
+        chunk.status = TransferStatus.COMPLETED
         
         # Update metrics
         transfer.status = TransferStatus.IN_PROGRESS
@@ -351,13 +349,14 @@ class StorageVirtualNode:
         purpose: str,
         cpu_scale: float = 1.0,
         memory_scale: float = 1.0,
+        work: Optional[Callable[[], None]] = None,
     ) -> bool:
         """Reserve CPU/memory via the VirtualOS before committing data."""
         pid = self.virtual_os.spawn_process(
             name=f"{purpose}-{self.node_id}",
             cpu_required=self._compute_cpu_requirement(chunk_size, cpu_scale),
             memory_required=self._compute_memory_requirement(chunk_size, memory_scale),
-            target=lambda: None,
+            target=work if work is not None else (lambda: None),
         )
         if pid is None:
             self.os_process_failures += 1
