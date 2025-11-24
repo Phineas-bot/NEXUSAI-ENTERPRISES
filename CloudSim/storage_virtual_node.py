@@ -6,6 +6,7 @@ from enum import Enum, auto
 import hashlib
 
 from virtual_disk import VirtualDisk
+from virtual_os import ProcessState, VirtualOS
 
 class TransferStatus(Enum):
     PENDING = auto()
@@ -41,6 +42,10 @@ class NetworkInterface:
 
 
 class StorageVirtualNode:
+    _CPU_SECONDS_PER_MB = 0.002  # Tunable constant representing CPU seconds needed per MB processed
+    _WORKING_SET_FRACTION = 0.05  # Percent of total memory to reserve per active chunk (capped by chunk size)
+    _MIN_WORKING_SET_BYTES = 4 * 1024 * 1024
+
     def __init__(
         self,
         node_id: str,
@@ -52,8 +57,9 @@ class StorageVirtualNode:
         self.node_id = node_id
         self.cpu_capacity = cpu_capacity
         self.memory_capacity = memory_capacity
-        self.total_storage = storage_capacity * 1024 * 1024 * 1024  # Convert GB to bytes
-        self.bandwidth = bandwidth * 1000000  # Convert Mbps to bits per second
+        self.total_storage = int(storage_capacity * 1024 * 1024 * 1024)  # Convert GB to bytes
+        self.memory_capacity_bytes = max(1, int(memory_capacity * 1024 * 1024 * 1024))
+        self.bandwidth = int(bandwidth * 1_000_000)  # Convert Mbps to bits per second
         self.ip_address: Optional[str] = None
         self.network_interfaces: Dict[str, NetworkInterface] = {}
         self.link_latencies: Dict[str, float] = {}
@@ -63,11 +69,17 @@ class StorageVirtualNode:
         self.stored_files: Dict[str, FileTransfer] = {}
         self.network_utilization = 0  # Current bandwidth usage
         self.disk = VirtualDisk(self.total_storage)
+        self.virtual_os = VirtualOS(
+            cpu_capacity=max(1, self.cpu_capacity),
+            memory_capacity_bytes=self.memory_capacity_bytes,
+            cpu_time_slice=0.01,
+        )
         
         # Performance metrics
         self.total_requests_processed = 0
         self.total_data_transferred = 0  # in bytes
         self.failed_transfers = 0
+        self.os_process_failures = 0
         
         # Network connections (node_id: bandwidth_available)
         self.connections: Dict[str, int] = {}
@@ -194,6 +206,11 @@ class StorageVirtualNode:
         chunk.status = TransferStatus.COMPLETED
         chunk.stored_node = self.node_id
 
+        # Simulate CPU/memory consumption through the virtual OS
+        if not self._execute_chunk_process(chunk.size, purpose="ingest"):
+            self.abort_transfer(file_id)
+            return False
+
         try:
             self.disk.write_chunk(file_id, chunk_id, data=None, expected_size=chunk.size)
         except (ValueError, KeyError):
@@ -287,5 +304,109 @@ class StorageVirtualNode:
             "total_requests_processed": self.total_requests_processed,
             "total_data_transferred_bytes": self.total_data_transferred,
             "failed_transfers": self.failed_transfers,
-            "current_active_transfers": len(self.active_transfers)
+            "current_active_transfers": len(self.active_transfers),
+            "os_used_memory_bytes": self.virtual_os.used_memory,
+            "os_process_failures": self.os_process_failures,
         }
+
+    def os_tick(self) -> None:
+        """Advance the virtual OS scheduler according to CPU capacity."""
+        timeslices = max(1, int(self.cpu_capacity))
+        for _ in range(timeslices):
+            if not self.virtual_os.has_runnable_work():
+                break
+            self.virtual_os.schedule_tick()
+
+    def start_chunk_transmission(self, chunk_size: int) -> Optional[int]:
+        """Spawn a non-blocking OS process to govern outbound chunk handling."""
+        pid = self._start_async_chunk_process(
+            chunk_size,
+            purpose="egress",
+            cpu_scale=0.5,
+            memory_scale=1.0,
+        )
+        if pid is None:
+            self.os_process_failures += 1
+        return pid
+
+    def complete_chunk_transmission(self, pid: Optional[int]) -> None:
+        if pid is None:
+            return
+        process = self.virtual_os.get_process(pid)
+        if not process:
+            return
+        if process.state == ProcessState.FAILED:
+            self.os_process_failures += 1
+            return
+        if process.state == ProcessState.COMPLETED:
+            return
+        if not self._run_process_to_completion(pid):
+            self.virtual_os.kill_process(pid)
+            self.os_process_failures += 1
+
+    def _execute_chunk_process(
+        self,
+        chunk_size: int,
+        *,
+        purpose: str,
+        cpu_scale: float = 1.0,
+        memory_scale: float = 1.0,
+    ) -> bool:
+        """Reserve CPU/memory via the VirtualOS before committing data."""
+        pid = self.virtual_os.spawn_process(
+            name=f"{purpose}-{self.node_id}",
+            cpu_required=self._compute_cpu_requirement(chunk_size, cpu_scale),
+            memory_required=self._compute_memory_requirement(chunk_size, memory_scale),
+            target=lambda: None,
+        )
+        if pid is None:
+            self.os_process_failures += 1
+            return False
+
+        if not self._run_process_to_completion(pid):
+            self.virtual_os.kill_process(pid)
+            self.os_process_failures += 1
+            return False
+        return True
+
+    def _start_async_chunk_process(
+        self,
+        chunk_size: int,
+        *,
+        purpose: str,
+        cpu_scale: float = 1.0,
+        memory_scale: float = 1.0,
+    ) -> Optional[int]:
+        pid = self.virtual_os.spawn_process(
+            name=f"{purpose}-{self.node_id}",
+            cpu_required=self._compute_cpu_requirement(chunk_size, cpu_scale),
+            memory_required=self._compute_memory_requirement(chunk_size, memory_scale),
+            target=lambda: None,
+        )
+        if pid is None:
+            return None
+        return pid
+
+    def _compute_memory_requirement(self, chunk_size: int, scale: float) -> int:
+        working_set = min(int(self.memory_capacity_bytes * self._WORKING_SET_FRACTION), chunk_size)
+        working_set = max(working_set, min(self._MIN_WORKING_SET_BYTES, self.memory_capacity_bytes))
+        return max(1, int(working_set * max(scale, 0.01)))
+
+    def _compute_cpu_requirement(self, chunk_size: int, scale: float) -> float:
+        base = max(
+            0.001,
+            (chunk_size / (1024 * 1024)) * self._CPU_SECONDS_PER_MB / max(1, self.cpu_capacity),
+        )
+        return max(0.001, base * max(scale, 0.01))
+
+    def _run_process_to_completion(self, pid: int, max_ticks: int = 10_000) -> bool:
+        for _ in range(max_ticks):
+            process = self.virtual_os.get_process(pid)
+            if not process:
+                return False
+            if process.state == ProcessState.COMPLETED:
+                return True
+            if process.state == ProcessState.FAILED:
+                return False
+            self.virtual_os.schedule_tick()
+        return False

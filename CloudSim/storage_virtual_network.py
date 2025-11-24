@@ -26,6 +26,7 @@ class ActiveChunk:
     remaining_bytes: float
     path: List[str]
     hop_index: int = 0
+    os_pid: Optional[int] = None
 
     def current_hop_nodes(self) -> Tuple[str, str]:
         return self.path[self.hop_index], self.path[self.hop_index + 1]
@@ -249,16 +250,20 @@ class StorageVirtualNetwork:
             self._tick_scheduled = True
             self.simulator.schedule_in(0.0, self._network_tick)
 
-    def _attach_chunk_to_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
+    def _attach_chunk_to_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> bool:
         source, target = state.current_hop_nodes()
+        if not self._start_chunk_hop(state):
+            return False
         link_key = self._link_key(source, target)
         self.link_active_chunks[link_key].add(chunk_key)
         self.node_active_chunks[source].add(chunk_key)
         self.node_active_chunks[target].add(chunk_key)
         self._recalculate_link_share(source, target)
+        return True
 
     def _detach_chunk_from_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
         source, target = state.current_hop_nodes()
+        self._finish_chunk_hop(state)
         link_key = self._link_key(source, target)
         link_chunks = self.link_active_chunks.get(link_key)
         if link_chunks:
@@ -277,7 +282,8 @@ class StorageVirtualNetwork:
     def _advance_chunk_to_next_hop(self, chunk_key: ChunkKey, state: ActiveChunk) -> None:
         self._detach_chunk_from_link(chunk_key, state)
         state.hop_index += 1
-        self._attach_chunk_to_link(chunk_key, state)
+        if not self._attach_chunk_to_link(chunk_key, state):
+            self._fail_active_chunk(chunk_key, "Insufficient node resources for next hop")
 
     def _register_node_cluster(self, node_id: str, root_id: Optional[str] = None) -> None:
         root = root_id or self.node_roots.get(node_id) or node_id
@@ -458,7 +464,9 @@ class StorageVirtualNetwork:
 
         self.active_chunks[chunk_key] = state
         self.chunk_bandwidths[chunk_key] = 0.0
-        self._attach_chunk_to_link(chunk_key, state)
+        if not self._attach_chunk_to_link(chunk_key, state):
+            self._fail_active_chunk(chunk_key, "Insufficient node resources for chunk transmission")
+            return
 
         next_chunk.status = TransferStatus.IN_PROGRESS
         transfer.status = TransferStatus.IN_PROGRESS
@@ -563,6 +571,26 @@ class StorageVirtualNetwork:
         self._detach_chunk_from_link(chunk_key, state)
         self.active_chunks.pop(chunk_key, None)
         self.chunk_bandwidths.pop(chunk_key, None)
+
+    def _start_chunk_hop(self, state: ActiveChunk) -> bool:
+        source, _ = state.current_hop_nodes()
+        node = self.nodes.get(source)
+        if not node:
+            return False
+        pid = node.start_chunk_transmission(state.chunk.size)
+        if pid is None:
+            return False
+        state.os_pid = pid
+        return True
+
+    def _finish_chunk_hop(self, state: ActiveChunk) -> None:
+        if state.os_pid is None:
+            return
+        source, _ = state.current_hop_nodes()
+        node = self.nodes.get(source)
+        if node:
+            node.complete_chunk_transmission(state.os_pid)
+        state.os_pid = None
 
     def _recalculate_all_link_shares(self) -> None:
         for source_node_id, target_node_id in list(self.link_active_chunks.keys()):

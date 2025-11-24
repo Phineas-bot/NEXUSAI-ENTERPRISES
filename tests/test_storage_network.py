@@ -145,3 +145,47 @@ def test_multi_hop_routing_selects_lowest_latency_path():
 
     assert transfer.status == TransferStatus.COMPLETED
     assert network.get_route("node-a", "node-c") == ["node-a", "node-b", "node-c"]
+
+
+def test_virtual_os_backpressure_limits_parallel_transmissions():
+    sim = Simulator()
+    network = StorageVirtualNetwork(sim, tick_interval=0.005)
+
+    constrained_source = StorageVirtualNode(
+        "node-a",
+        cpu_capacity=2,
+        memory_capacity=0.001,  # ~1MB of RAM, so only one chunk process fits
+        storage_capacity=500,
+        bandwidth=BANDWIDTH_MBPS,
+    )
+    roomy_target = StorageVirtualNode(
+        "node-b",
+        cpu_capacity=8,
+        memory_capacity=64,
+        storage_capacity=2000,
+        bandwidth=BANDWIDTH_MBPS,
+    )
+
+    network.add_node(constrained_source)
+    network.add_node(roomy_target)
+    network.connect_nodes("node-a", "node-b", bandwidth=BANDWIDTH_MBPS)
+
+    transfers = []
+    for idx in range(4):
+        transfer = network.initiate_file_transfer(
+            "node-a",
+            "node-b",
+            f"os-pressure-{idx}.bin",
+            200 * 1024 * 1024,
+        )
+        assert transfer is not None
+        transfers.append(transfer)
+
+    sim.run()
+
+    completed = [t for t in transfers if t.status == TransferStatus.COMPLETED]
+    failed = [t for t in transfers if t.status == TransferStatus.FAILED]
+
+    assert len(completed) == 1
+    assert len(failed) == len(transfers) - 1
+    assert network.nodes["node-a"].os_process_failures >= len(failed)
