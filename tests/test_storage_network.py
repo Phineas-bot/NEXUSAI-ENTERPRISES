@@ -22,9 +22,15 @@ def _build_network(
     target_storage_gb: int = 500,
     bandwidth_mbps: int = BANDWIDTH_MBPS,
     scaling_config: Optional[DemandScalingConfig] = None,
+    routing_strategy: str = "link_state",
 ):
     sim = Simulator()
-    network = StorageVirtualNetwork(sim, tick_interval=0.005, scaling_config=scaling_config)
+    network = StorageVirtualNetwork(
+        sim,
+        tick_interval=0.005,
+        scaling_config=scaling_config,
+        routing_strategy=routing_strategy,
+    )
 
     source = StorageVirtualNode(
         "node-a",
@@ -146,6 +152,82 @@ def test_multi_hop_routing_selects_lowest_latency_path():
 
     assert transfer.status == TransferStatus.COMPLETED
     assert network.get_route("node-a", "node-c") == ["node-a", "node-b", "node-c"]
+
+
+def test_distance_vector_routing_selects_lowest_latency_path():
+    sim = Simulator()
+    network = StorageVirtualNetwork(sim, tick_interval=0.005, routing_strategy="distance_vector")
+
+    node_a = StorageVirtualNode("node-a", 4, 16, 500, BANDWIDTH_MBPS)
+    node_b = StorageVirtualNode("node-b", 4, 16, 500, BANDWIDTH_MBPS)
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    node_d = StorageVirtualNode("node-d", 4, 16, 500, BANDWIDTH_MBPS)
+
+    for node in (node_a, node_b, node_c, node_d):
+        network.add_node(node)
+
+    network.connect_nodes("node-a", "node-b", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-b", "node-c", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-a", "node-d", bandwidth=500, latency_ms=5.0)
+    network.connect_nodes("node-d", "node-c", bandwidth=500, latency_ms=5.0)
+
+    path = network.get_route("node-a", "node-c")
+    assert path == ["node-a", "node-b", "node-c"]
+
+
+def test_link_failure_reroutes_inflight_transfer():
+    sim = Simulator()
+    network = StorageVirtualNetwork(sim, tick_interval=0.005)
+
+    node_a = StorageVirtualNode("node-a", 4, 16, 500, BANDWIDTH_MBPS)
+    node_b = StorageVirtualNode("node-b", 4, 16, 500, BANDWIDTH_MBPS)
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    node_d = StorageVirtualNode("node-d", 4, 16, 500, BANDWIDTH_MBPS)
+
+    for node in (node_a, node_b, node_c, node_d):
+        network.add_node(node)
+
+    network.connect_nodes("node-a", "node-b", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-b", "node-c", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-a", "node-d", bandwidth=500, latency_ms=5.0)
+    network.connect_nodes("node-d", "node-c", bandwidth=500, latency_ms=5.0)
+
+    transfer = network.initiate_file_transfer("node-a", "node-c", "reroute.bin", 50 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run(until=0.01)
+    assert network.fail_link("node-a", "node-b")
+
+    sim.run()
+
+    assert transfer.status == TransferStatus.COMPLETED
+    assert network.get_route("node-a", "node-c") == ["node-a", "node-d", "node-c"]
+
+
+def test_node_failure_aborts_transfer():
+    sim = Simulator()
+    network = StorageVirtualNetwork(sim, tick_interval=0.005)
+
+    node_a = StorageVirtualNode("node-a", 4, 16, 500, BANDWIDTH_MBPS)
+    node_b = StorageVirtualNode("node-b", 4, 16, 500, BANDWIDTH_MBPS)
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+
+    for node in (node_a, node_b, node_c):
+        network.add_node(node)
+
+    network.connect_nodes("node-a", "node-b", bandwidth=500, latency_ms=1.0)
+    network.connect_nodes("node-b", "node-c", bandwidth=500, latency_ms=1.0)
+
+    transfer = network.initiate_file_transfer("node-a", "node-c", "node-failure.bin", 40 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run(until=0.01)
+    assert network.fail_node("node-b")
+
+    sim.run()
+
+    assert transfer.status == TransferStatus.FAILED
+    assert node_c.failed_transfers >= 1
 
 
 def test_virtual_os_backpressure_limits_parallel_transmissions():
@@ -326,3 +408,40 @@ def test_demand_scaling_triggers_on_os_memory_pressure():
     source_cluster = network.get_cluster_nodes("node-a")
     target_cluster = network.get_cluster_nodes("node-b")
     assert len(source_cluster) >= 2 or len(target_cluster) >= 2
+
+
+def test_network_device_reservation_limits_concurrent_transmissions():
+    node = StorageVirtualNode("isolated", cpu_capacity=1, memory_capacity=8, storage_capacity=100, bandwidth=100)
+    pid_one = node.start_chunk_transmission(5 * 1024 * 1024)
+    assert pid_one is not None
+
+    pid_two = node.start_chunk_transmission(5 * 1024 * 1024)
+    assert pid_two is None  # Reservation device allows only one inflight transmission
+
+    node.complete_chunk_transmission(pid_one)
+
+    pid_three = node.start_chunk_transmission(5 * 1024 * 1024)
+    assert pid_three is not None
+    node.complete_chunk_transmission(pid_three)
+
+
+def test_background_jobs_execute_via_virtual_os_processes():
+    node = StorageVirtualNode("maint-node", cpu_capacity=4, memory_capacity=16, storage_capacity=200, bandwidth=200)
+    counter = {"runs": 0}
+
+    def scrub_task():
+        counter["runs"] += 1
+
+    pid = node.schedule_background_job(
+        "scrub",
+        cpu_seconds=0.02,
+        memory_bytes=4 * 1024 * 1024,
+        task=scrub_task,
+    )
+    assert pid is not None
+
+    node.drain_background_jobs()
+    assert counter["runs"] == 1
+
+    metrics = node.virtual_os.get_device_metrics(f"maintenance:{node.node_id}")
+    assert metrics is not None and metrics["inflight"] == 0

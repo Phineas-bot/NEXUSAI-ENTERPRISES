@@ -6,7 +6,7 @@ from enum import Enum, auto
 import hashlib
 
 from virtual_disk import VirtualDisk
-from virtual_os import ProcessState, VirtualOS
+from virtual_os import ProcessState, VirtualOS, SyscallContext, SyscallResult
 
 class TransferStatus(Enum):
     PENDING = auto()
@@ -80,6 +80,13 @@ class StorageVirtualNode:
             memory_capacity_bytes=self.memory_capacity_bytes,
             cpu_time_slice=0.01,
         )
+        self._disk_device_name = f"disk:{self.node_id}"
+        self._network_device_name = f"nic:{self.node_id}"
+        self._maintenance_device_name = f"maintenance:{self.node_id}"
+        self._transmission_tickets: Dict[int, Optional[int]] = {}
+        self._maintenance_tickets: Dict[int, Optional[int]] = {}
+        self._background_jobs: Dict[str, List[int]] = {}
+        self._register_virtual_os_devices()
         
         # Performance metrics
         self.total_requests_processed = 0
@@ -212,7 +219,14 @@ class StorageVirtualNode:
         chunk.status = TransferStatus.IN_PROGRESS
 
         def commit_chunk() -> None:
-            self.disk.write_chunk(file_id, chunk_id, data=None, expected_size=chunk.size)
+            result = self.virtual_os.invoke_syscall(
+                "disk_write",
+                file_id=file_id,
+                chunk_id=chunk_id,
+                size=chunk.size,
+            )
+            if not result.success:
+                raise RuntimeError(result.error or "disk-write-failed")
 
         # Simulate CPU/memory consumption through the virtual OS (includes disk commit)
         if not self._execute_chunk_process(chunk.size, purpose="ingest", work=commit_chunk):
@@ -324,6 +338,14 @@ class StorageVirtualNode:
 
     def start_chunk_transmission(self, chunk_size: int) -> Optional[int]:
         """Spawn a non-blocking OS process to govern outbound chunk handling."""
+        syscall = self.virtual_os.invoke_syscall(
+            "network_send",
+            bytes=chunk_size,
+        )
+        if not syscall.success:
+            self.os_process_failures += 1
+            return None
+        ticket = syscall.metadata.get("ticket")
         pid = self._start_async_chunk_process(
             chunk_size,
             purpose="egress",
@@ -331,23 +353,102 @@ class StorageVirtualNode:
             memory_scale=1.0,
         )
         if pid is None:
+            self.virtual_os.complete_device_request(
+                self._network_device_name,
+                ticket,
+                success=False,
+                error="chunk-transmission-not-started",
+            )
             self.os_process_failures += 1
+            return None
+        self._transmission_tickets[pid] = ticket
         return pid
 
     def complete_chunk_transmission(self, pid: Optional[int]) -> None:
         if pid is None:
             return
+        ticket = self._transmission_tickets.pop(pid, None)
         process = self.virtual_os.get_process(pid)
         if not process:
+            self.virtual_os.complete_device_request(
+                self._network_device_name,
+                ticket,
+                success=False,
+                error="missing-egress-process",
+            )
             return
         if process.state == ProcessState.FAILED:
             self.os_process_failures += 1
+            self.virtual_os.complete_device_request(
+                self._network_device_name,
+                ticket,
+                success=False,
+                error="egress-process-failed",
+            )
             return
-        if process.state == ProcessState.COMPLETED:
-            return
-        if not self._run_process_to_completion(pid):
-            self.virtual_os.kill_process(pid)
+        if process.state != ProcessState.COMPLETED:
+            if not self._run_process_to_completion(pid):
+                self.virtual_os.kill_process(pid)
+                self.os_process_failures += 1
+                self.virtual_os.complete_device_request(
+                    self._network_device_name,
+                    ticket,
+                    success=False,
+                    error="egress-process-timeout",
+                )
+                return
+        self.virtual_os.complete_device_request(
+            self._network_device_name,
+            ticket,
+            success=True,
+        )
+
+    def schedule_background_job(
+        self,
+        job_name: str,
+        *,
+        cpu_seconds: float,
+        memory_bytes: int,
+        task: Callable[[], None],
+    ) -> Optional[int]:
+        syscall = self.virtual_os.invoke_syscall("maintenance_hook", job_name=job_name)
+        if not syscall.success:
             self.os_process_failures += 1
+            return None
+        ticket = syscall.metadata.get("ticket")
+        pid = self.virtual_os.spawn_process(
+            name=f"bg-{job_name}-{self.node_id}",
+            cpu_required=max(cpu_seconds, 0.001),
+            memory_required=max(memory_bytes, 1),
+            target=task,
+        )
+        if pid is None:
+            self.virtual_os.complete_device_request(
+                self._maintenance_device_name,
+                ticket,
+                success=False,
+                error="background-process-spawn-failed",
+            )
+            self.os_process_failures += 1
+            return None
+        self._background_jobs.setdefault(job_name, []).append(pid)
+        self._maintenance_tickets[pid] = ticket
+        return pid
+
+    def drain_background_jobs(self) -> None:
+        for job_name in list(self._background_jobs.keys()):
+            for pid in self._background_jobs[job_name]:
+                success = self._run_process_to_completion(pid)
+                if not success:
+                    self.virtual_os.kill_process(pid)
+                    self.os_process_failures += 1
+                self.virtual_os.complete_device_request(
+                    self._maintenance_device_name,
+                    self._maintenance_tickets.pop(pid, None),
+                    success=success,
+                    error=None if success else "background-process-failed",
+                )
+            self._background_jobs[job_name] = []
 
     def prepare_chunk_read(self, transfer: FileTransfer, chunk: FileChunk) -> bool:
         if not transfer.is_retrieval:
@@ -356,7 +457,14 @@ class StorageVirtualNode:
         backing_file_id = transfer.backing_file_id or transfer.file_id
 
         def read_chunk() -> None:
-            self.disk.read_chunk(backing_file_id, chunk.chunk_id)
+            result = self.virtual_os.invoke_syscall(
+                "disk_read",
+                file_id=backing_file_id,
+                chunk_id=chunk.chunk_id,
+                size=chunk.size,
+            )
+            if not result.success:
+                raise RuntimeError(result.error or "disk-read-failed")
 
         return self._execute_chunk_process(
             chunk.size,
@@ -431,3 +539,84 @@ class StorageVirtualNode:
                 return False
             self.virtual_os.schedule_tick()
         return False
+
+    def _register_virtual_os_devices(self) -> None:
+        self.virtual_os.register_device(
+            self._disk_device_name,
+            handler=self._disk_device_handler,
+            max_inflight=4,
+        )
+        self.virtual_os.register_device(
+            self._network_device_name,
+            handler=self._network_device_handler,
+            max_inflight=max(1, int(self.cpu_capacity)),
+        )
+        self.virtual_os.register_device(
+            self._maintenance_device_name,
+            handler=self._maintenance_device_handler,
+            max_inflight=1,
+        )
+
+        self.virtual_os.register_syscall("disk_write", self._sys_disk_write)
+        self.virtual_os.register_syscall("disk_read", self._sys_disk_read)
+        self.virtual_os.register_syscall("network_send", self._sys_network_send)
+        self.virtual_os.register_syscall("maintenance_hook", self._sys_maintenance_hook)
+
+    def _disk_device_handler(self, payload: Dict[str, Union[str, int]]) -> None:
+        operation = payload.get("op")
+        file_id = str(payload.get("file_id"))
+        chunk_id = int(payload.get("chunk_id", 0))
+        if operation == "write":
+            self.disk.write_chunk(file_id, chunk_id, data=None, expected_size=int(payload.get("size", 0)))
+        elif operation == "read":
+            self.disk.read_chunk(file_id, chunk_id)
+        else:
+            raise ValueError(f"Unsupported disk op '{operation}'")
+
+    def _network_device_handler(self, payload: Dict[str, Union[str, int]]) -> Dict[str, Union[str, int]]:
+        return payload
+
+    def _maintenance_device_handler(self, payload: Dict[str, Union[str, int]]) -> Dict[str, Union[str, int]]:
+        return payload
+
+    def _sys_disk_write(self, ctx: SyscallContext, *, file_id: str, chunk_id: int, size: int) -> SyscallResult:
+        return ctx.device_call(
+            self._disk_device_name,
+            {
+                "op": "write",
+                "file_id": file_id,
+                "chunk_id": chunk_id,
+                "size": size,
+            },
+        )
+
+    def _sys_disk_read(self, ctx: SyscallContext, *, file_id: str, chunk_id: int, size: int) -> SyscallResult:
+        return ctx.device_call(
+            self._disk_device_name,
+            {
+                "op": "read",
+                "file_id": file_id,
+                "chunk_id": chunk_id,
+                "size": size,
+            },
+        )
+
+    def _sys_network_send(self, ctx: SyscallContext, *, bytes: int) -> SyscallResult:
+        return ctx.device_call(
+            self._network_device_name,
+            {
+                "bytes": bytes,
+                "node": self.node_id,
+            },
+            mode="reservation",
+        )
+
+    def _sys_maintenance_hook(self, ctx: SyscallContext, *, job_name: str) -> SyscallResult:
+        return ctx.device_call(
+            self._maintenance_device_name,
+            {
+                "job": job_name,
+                "node": self.node_id,
+            },
+            mode="reservation",
+        )

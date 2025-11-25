@@ -52,6 +52,7 @@ class StorageVirtualNetwork:
         simulator: Simulator,
         tick_interval: float = 0.01,
         scaling_config: Optional[DemandScalingConfig] = None,
+        routing_strategy: str = "link_state",
     ):
         self.simulator = simulator
         self.tick_interval = tick_interval
@@ -59,6 +60,9 @@ class StorageVirtualNetwork:
         self.transfer_operations: Dict[str, Dict[str, FileTransfer]] = defaultdict(dict)
         self.transfer_observers: List[Callable[[Dict[str, Any]], None]] = []
         self.scaling = scaling_config or DemandScalingConfig()
+        self.routing_strategy = routing_strategy.lower()
+        if self.routing_strategy not in {"link_state", "distance_vector"}:
+            raise ValueError("routing_strategy must be 'link_state' or 'distance_vector'")
 
         # Concurrent transfer bookkeeping
         self.active_chunks: Dict[ChunkKey, ActiveChunk] = {}
@@ -74,6 +78,8 @@ class StorageVirtualNetwork:
         # Network topology and addressing
         self.link_latency_ms: Dict[Tuple[str, str], float] = {}
         self._ip_counter = 1
+        self.failed_links: Set[Tuple[str, str]] = set()
+        self.failed_nodes: Set[str] = set()
         self._os_failure_baseline: Dict[str, int] = defaultdict(int)
         
     def add_node(self, node: StorageVirtualNode, root_id: Optional[str] = None):
@@ -83,6 +89,7 @@ class StorageVirtualNetwork:
         self.nodes[node.node_id] = node
         self._register_node_cluster(node.node_id, root_id)
         self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
+        self.failed_nodes.discard(node.node_id)
         
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
         """Connect two nodes with specified bandwidth and latency"""
@@ -93,6 +100,39 @@ class StorageVirtualNetwork:
             self.link_latency_ms[(node2_id, node1_id)] = latency_ms
             return True
         return False
+
+    def fail_link(self, node1_id: str, node2_id: str) -> bool:
+        if node1_id not in self.nodes or node2_id not in self.nodes:
+            return False
+        link = self._link_key(node1_id, node2_id)
+        reverse = self._link_key(node2_id, node1_id)
+        if link in self.failed_links:
+            return True
+        self.failed_links.add(link)
+        self.failed_links.add(reverse)
+        self._handle_link_failure(node1_id, node2_id)
+        return True
+
+    def restore_link(self, node1_id: str, node2_id: str) -> None:
+        link = self._link_key(node1_id, node2_id)
+        reverse = self._link_key(node2_id, node1_id)
+        self.failed_links.discard(link)
+        self.failed_links.discard(reverse)
+        self._recalculate_link_share(node1_id, node2_id)
+
+    def fail_node(self, node_id: str) -> bool:
+        if node_id not in self.nodes:
+            return False
+        if node_id in self.failed_nodes:
+            return True
+        self.failed_nodes.add(node_id)
+        self.nodes[node_id].network_utilization = 0.0
+        self._handle_node_failure(node_id)
+        return True
+
+    def restore_node(self, node_id: str) -> None:
+        self.failed_nodes.discard(node_id)
+        self._recalculate_all_link_shares()
     
     def initiate_file_transfer(
         self,
@@ -237,6 +277,10 @@ class StorageVirtualNetwork:
         return (source_node_id, target_node_id, file_id, chunk_id)
 
     def _link_capacity(self, source_node_id: str, target_node_id: str) -> float:
+        if self._should_skip_node(source_node_id) or self._should_skip_node(target_node_id):
+            return 0.0
+        if self._is_link_failed(source_node_id, target_node_id):
+            return 0.0
         source_node = self.nodes[source_node_id]
         target_node = self.nodes[target_node_id]
         link_bandwidth = min(
@@ -246,26 +290,40 @@ class StorageVirtualNetwork:
         return float(min(link_bandwidth, source_node.bandwidth, target_node.bandwidth))
 
     def _neighbor_links(self, node_id: str) -> List[Tuple[str, float]]:
+        if self._should_skip_node(node_id):
+            return []
         node = self.nodes[node_id]
         neighbors: List[Tuple[str, float]] = []
         for neighbor_id in node.connections.keys():
             if neighbor_id not in self.nodes:
+                continue
+            if self._should_skip_node(neighbor_id):
+                continue
+            if self._is_link_failed(node_id, neighbor_id):
                 continue
             latency = self.link_latency_ms.get((node_id, neighbor_id), 1.0)
             neighbors.append((neighbor_id, latency))
         return neighbors
 
     def _compute_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
+        if self._should_skip_node(source_node_id) or self._should_skip_node(target_node_id):
+            return None
         if source_node_id == target_node_id:
             return [source_node_id]
+        if self.routing_strategy == "distance_vector":
+            return self._compute_route_distance_vector(source_node_id, target_node_id)
+        return self._compute_route_link_state(source_node_id, target_node_id)
 
+    def _compute_route_link_state(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
+        if source_node_id not in self.nodes or target_node_id not in self.nodes:
+            return None
         visited: Set[str] = set()
         heap: List[Tuple[float, str, Optional[str]]] = [(0.0, source_node_id, None)]
-        parents: Dict[str, Optional[str]] = {}
+        parents: Dict[str, Optional[str]] = {source_node_id: None}
 
         while heap:
             cost, node_id, parent = heapq.heappop(heap)
-            if node_id in visited:
+            if node_id in visited or self._should_skip_node(node_id):
                 continue
             visited.add(node_id)
             parents[node_id] = parent
@@ -278,14 +336,58 @@ class StorageVirtualNetwork:
 
         if target_node_id not in parents:
             return None
+        return self._build_path(parents, source_node_id, target_node_id)
 
+    def _compute_route_distance_vector(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
+        active_nodes = [node_id for node_id in self.nodes if not self._should_skip_node(node_id)]
+        if source_node_id not in active_nodes or target_node_id not in active_nodes:
+            return None
+
+        dist: Dict[str, float] = {node_id: float("inf") for node_id in active_nodes}
+        parents: Dict[str, Optional[str]] = {source_node_id: None}
+        dist[source_node_id] = 0.0
+
+        for _ in range(len(active_nodes) - 1):
+            updated = False
+            for node_id in active_nodes:
+                if self._should_skip_node(node_id):
+                    continue
+                if dist[node_id] == float("inf"):
+                    continue
+                for neighbor_id, latency in self._neighbor_links(node_id):
+                    new_cost = dist[node_id] + latency
+                    if new_cost < dist.get(neighbor_id, float("inf")):
+                        dist[neighbor_id] = new_cost
+                        parents[neighbor_id] = node_id
+                        updated = True
+            if not updated:
+                break
+
+        if dist.get(target_node_id, float("inf")) == float("inf"):
+            return None
+        return self._build_path(parents, source_node_id, target_node_id)
+
+    def _build_path(
+        self,
+        parents: Dict[str, Optional[str]],
+        source_node_id: str,
+        target_node_id: str,
+    ) -> Optional[List[str]]:
         path: List[str] = []
         current: Optional[str] = target_node_id
         while current is not None:
             path.append(current)
+            if current == source_node_id:
+                path.reverse()
+                return path
             current = parents.get(current)
-        path.reverse()
-        return path
+        return None
+
+    def _should_skip_node(self, node_id: str) -> bool:
+        return node_id in self.failed_nodes
+
+    def _is_link_failed(self, node1_id: str, node2_id: str) -> bool:
+        return self._link_key(node1_id, node2_id) in self.failed_links
 
     def _ensure_tick(self) -> None:
         if not self._tick_scheduled:
@@ -294,6 +396,8 @@ class StorageVirtualNetwork:
 
     def _attach_chunk_to_link(self, chunk_key: ChunkKey, state: ActiveChunk) -> bool:
         source, target = state.current_hop_nodes()
+        if self._link_capacity(source, target) <= 0:
+            return False
         if not self._start_chunk_hop(state):
             return False
         link_key = self._link_key(source, target)
@@ -347,7 +451,7 @@ class StorageVirtualNetwork:
         candidates = [
             self.nodes[node_id]
             for node_id in self._get_cluster_nodes(requested_node_id)
-            if node_id in self.nodes
+            if node_id in self.nodes and node_id not in self.failed_nodes
         ]
         if not candidates:
             return None
@@ -662,6 +766,35 @@ class StorageVirtualNetwork:
         for node_id in self.nodes:
             if node_id not in self.node_active_chunks:
                 self.nodes[node_id].network_utilization = 0.0
+
+    def _handle_link_failure(self, node1_id: str, node2_id: str) -> None:
+        for link in (self._link_key(node1_id, node2_id), self._link_key(node2_id, node1_id)):
+            affected = list(self.link_active_chunks.get(link, []))
+            for chunk_key in affected:
+                self._reroute_or_fail_chunk(chunk_key, reason=f"Link {node1_id}-{node2_id} failed")
+
+    def _handle_node_failure(self, node_id: str) -> None:
+        self.node_active_chunks.pop(node_id, None)
+        for chunk_key, state in list(self.active_chunks.items()):
+            if state.source == node_id or state.target == node_id:
+                self._fail_active_chunk(chunk_key, f"Node {node_id} failed")
+                continue
+            if node_id in state.path:
+                self._reroute_or_fail_chunk(chunk_key, reason=f"Node {node_id} failed")
+
+    def _reroute_or_fail_chunk(self, chunk_key: ChunkKey, reason: str) -> None:
+        state = self.active_chunks.get(chunk_key)
+        if not state:
+            return
+        self._detach_chunk_from_link(chunk_key, state)
+        new_route = self._compute_route(state.source, state.target)
+        if not new_route or len(new_route) < 2:
+            self._fail_active_chunk(chunk_key, reason)
+            return
+        state.path = new_route
+        state.hop_index = 0
+        if not self._attach_chunk_to_link(chunk_key, state):
+            self._fail_active_chunk(chunk_key, reason)
 
     def _recalculate_link_share(self, source_node_id: str, target_node_id: str) -> None:
         link_key = self._link_key(source_node_id, target_node_id)

@@ -25,7 +25,7 @@ cd "C:/Users/USER PRO/nexusAI/NEXUSAI-ENTERPRISES"
 The suite currently includes:
 
 - `tests/test_simulator.py`: Ensures the event scheduler respects absolute times and priority ordering.
-- `tests/test_storage_network.py`: Covers bandwidth fairness, decentralized demand scaling, multi-hop routing, and VirtualOS-driven backpressure for oversubscribed senders.
+- `tests/test_storage_network.py`: Covers bandwidth fairness, decentralized demand scaling, multi-hop routing, VirtualOS-driven backpressure, and the new failover+distance-vector routing scenarios.
 - `tests/test_virtual_disk.py`: Validates disk reservations, chunk commits, and capacity reclamation logic.
 - `tests/test_virtual_os.py`: Exercises the scheduler directly (process completion, memory pressure, and block/unblock cycles).
 
@@ -52,9 +52,17 @@ The suite currently includes:
 ## Routing & IP Simulation
 
 - `StorageVirtualNetwork` automatically assigns `10.0.x.y` addresses to nodes and tracks per-link latency and bandwidth metrics.
-- A link-state shortest-path algorithm (Dijkstra) computes end-to-end routes; transfers that lack a route fail fast, and tests can introspect the chosen path via `StorageVirtualNetwork.get_route`.
+- A link-state shortest-path algorithm (Dijkstra) or optional distance-vector strategy computes end-to-end routes; transfers that lack a route fail fast, and tests can introspect the chosen path via `StorageVirtualNetwork.get_route`.
 - Each chunk traverses every hop in its route, sharing bandwidth per link; excess capacity on one hop immediately advances the chunk to the next hop, so pipelines form naturally.
 - Latency metrics propagate when replica nodes spawn, ensuring new links integrate seamlessly with the routing fabric.
+
+## Network Failover & Advanced Routing
+
+- `StorageVirtualNetwork` now accepts a `routing_strategy` of `"link-state"` (default) or `"distance-vector"`, letting scenarios bias toward global optimality or hop-by-hop convergence without rewriting tests.
+- Links and nodes expose `fail_link`, `restore_link`, `fail_node`, and `restore_node` helpers so simulations can trigger outages; the network automatically removes failed resources from routing tables.
+- In-flight transfers detect mid-route failures, attempt to recompute a viable path, and either resume on the new route or surface deterministic errors if capacity is exhausted or isolation persists.
+- Distance-vector routing uses periodic neighbor updates with latency-aware weights, producing different but predictable paths that the new regression suite asserts explicitly.
+- See `tests/test_storage_network.py::test_link_failure_reroutes_inflight_transfer`, `...::test_node_failure_aborts_transfer`, and `...::test_distance_vector_routing_selects_lowest_latency_path` for concrete failover and strategy coverage.
 
 ## Virtual OS Resource Model
 
@@ -64,3 +72,6 @@ The suite currently includes:
 - Disk operations run as VirtualOS processes as well; when `VirtualDisk.write_chunk` raises, the owning node increments `os_process_failures`, and transfers fail deterministically (`tests/test_storage_network.py::test_disk_failures_increment_os_process_counters`).
 - Demand scaling now inspects OS pressure: configure `os_failure_threshold` (spawns replicas after N recent process failures) and `os_memory_utilization_threshold` (replicates when RAM pressure stays high) in `DemandScalingConfig` to keep hot nodes from thrashing their virtual kernels.
 - Use `StorageVirtualNetwork.initiate_replica_transfer(owner_node_id, target_node_id, file_id)` to clone stored data across the network. Each chunk read is scheduled via `prepare_chunk_read`, so replication respects CPU/RAM budgets and bubbles up disk read failures just like ingestion (`tests/test_storage_network.py::test_replica_transfer_streams_chunks_via_virtual_os`).
+- The VirtualOS now exposes explicit syscalls (`disk_read`, `disk_write`, `network_send`, `maintenance_hook`) backed by device abstractions so disks, NICs, and maintenance hooks enforce centralized backpressure instead of ad-hoc driver calls.
+- Device reservations emit interrupts when work finishes; tests such as `tests/test_virtual_os.py::test_syscalls_route_through_devices_and_interrupts` and `...::test_reservation_devices_enforce_backpressure` cover the behavior.
+- Background maintenance (replication, scrubbing) can be scheduled through `StorageVirtualNode.schedule_background_job`, which spins VirtualOS processes and uses the maintenance syscall so only one heavy job runs per node at a time (`tests/test_storage_network.py::test_background_jobs_execute_via_virtual_os_processes`).

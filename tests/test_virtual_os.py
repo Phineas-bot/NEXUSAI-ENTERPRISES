@@ -74,3 +74,65 @@ def test_process_target_runs_only_once():
 
     assert os.get_process(pid).state == ProcessState.COMPLETED
     assert call_counter["count"] == 1
+
+
+def test_syscalls_route_through_devices_and_interrupts():
+    os = VirtualOS(cpu_capacity=1, memory_capacity_bytes=32 * 1024 * 1024)
+    observed = {"writes": 0, "interrupts": 0}
+
+    def disk_handler(payload):
+        observed["writes"] += 1
+        assert payload["file_id"] == "file-a"
+        return payload["size"]
+
+    os.register_device("disk:node", handler=disk_handler, max_inflight=1)
+
+    def on_interrupt(event):
+        observed["interrupts"] += 1
+        assert event.device_name == "disk:node"
+
+    os.register_interrupt_handler("disk:node", on_interrupt)
+
+    def syscall(ctx, *, file_id: str, chunk_id: int, size: int):
+        return ctx.device_call(
+            "disk:node",
+            {
+                "op": "write",
+                "file_id": file_id,
+                "chunk_id": chunk_id,
+                "size": size,
+            },
+        )
+
+    os.register_syscall("disk_write", syscall)
+    result = os.invoke_syscall("disk_write", file_id="file-a", chunk_id=1, size=4096)
+    assert result.success
+    assert observed["writes"] == 1
+    os.process_interrupts()
+    assert observed["interrupts"] == 1
+
+
+def test_reservation_devices_enforce_backpressure():
+    os = VirtualOS(cpu_capacity=1, memory_capacity_bytes=32 * 1024 * 1024)
+    os.register_device("nic:node", handler=None, max_inflight=1)
+
+    def reserve_nic(ctx, *, bytes: int):
+        return ctx.device_call(
+            "nic:node",
+            {"bytes": bytes},
+            mode="reservation",
+        )
+
+    os.register_syscall("network_send", reserve_nic)
+
+    first = os.invoke_syscall("network_send", bytes=1024)
+    assert first.success
+
+    second = os.invoke_syscall("network_send", bytes=512)
+    assert not second.success
+    assert "ticket" not in second.metadata
+
+    os.complete_device_request("nic:node", first.metadata.get("ticket"))
+
+    third = os.invoke_syscall("network_send", bytes=512)
+    assert third.success
