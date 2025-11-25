@@ -28,6 +28,29 @@ The suite currently includes:
 - `tests/test_storage_network.py`: Covers bandwidth fairness, decentralized demand scaling, multi-hop routing, VirtualOS-driven backpressure, and the new failover+distance-vector routing scenarios.
 - `tests/test_virtual_disk.py`: Validates disk reservations, chunk commits, and capacity reclamation logic.
 - `tests/test_virtual_os.py`: Exercises the scheduler directly (process completion, memory pressure, and block/unblock cycles).
+- `tests/test_demo_scenarios.py`: Smoke-tests the curated demo scenarios and their telemetry outputs.
+- `tests/test_controller.py`: Covers the interactive controller helpers (node creation/listing and size parsing utilities).
+
+## Interactive Control Shell
+
+Run the (default) interactive shell to create nodes, connect links, start transfers, and inspect cluster state without editing code:
+
+```powershell
+.venv\Scripts\python.exe CloudSim/main.py --mode interactive
+```
+
+Example session commands:
+
+```text
+cloudsim> add node-a --storage 500 --bandwidth 1500
+cloudsim> add node-b --storage 200
+cloudsim> connect node-a node-b --bandwidth 500
+cloudsim> transfer node-a node-b demo.bin 200MB
+cloudsim> nodes
+cloudsim> events 5
+```
+
+The shell keeps the simulator alive so you can mark nodes offline (`fail node-b`), restore them, disconnect links, or inspect replica clusters in real time. Use `help` or `help <command>` from inside the shell to see the full catalog of actions.
 
 ## Bandwidth-Sharing Expectations
 

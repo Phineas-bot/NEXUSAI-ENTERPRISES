@@ -132,6 +132,25 @@ class StorageVirtualNetwork:
             return True
         return False
 
+    def remove_node(self, node_id: str) -> bool:
+        node = self.nodes.get(node_id)
+        if not node:
+            return False
+        self.fail_node(node_id)
+        for neighbor_id in list(node.connections.keys()):
+            node.connections.pop(neighbor_id, None)
+            if neighbor_id in self.nodes:
+                self.nodes[neighbor_id].connections.pop(node_id, None)
+        self.nodes.pop(node_id, None)
+        root_id = self.node_roots.pop(node_id, None)
+        if root_id and root_id in self.cluster_nodes:
+            self.cluster_nodes[root_id].discard(node_id)
+            if not self.cluster_nodes[root_id]:
+                self.cluster_nodes.pop(root_id)
+        self.failed_nodes.discard(node_id)
+        self._replica_parents.pop(node_id, None)
+        return True
+
     def fail_link(self, node1_id: str, node2_id: str) -> bool:
         if node1_id not in self.nodes or node2_id not in self.nodes:
             return False

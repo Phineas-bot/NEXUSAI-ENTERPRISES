@@ -5,6 +5,7 @@ import json
 from typing import List
 
 from demo_scenarios import SCENARIOS, run_scenario
+from interactive_shell import launch_shell
 
 
 def _print_transfer_stats(transfers: List[dict]) -> None:
@@ -65,7 +66,13 @@ def _print_summary(summary: dict) -> None:
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="CloudSim scenario runner")
+    parser = argparse.ArgumentParser(description="CloudSim toolkit")
+    parser.add_argument(
+        "--mode",
+        choices=["scenario", "interactive"],
+        default="interactive",
+        help="Run curated scenarios or start the interactive shell",
+    )
     parser.add_argument(
         "--scenario",
         choices=["all", *SCENARIOS.keys()],
@@ -89,6 +96,10 @@ def _parse_args() -> argparse.Namespace:
 
 def main():
     args = _parse_args()
+    if args.mode == "interactive":
+        launch_shell()
+        return
+
     if args.list:
         print("Available scenarios:")
         for name in SCENARIOS:
