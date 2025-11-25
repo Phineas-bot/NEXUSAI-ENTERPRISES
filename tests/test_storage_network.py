@@ -128,6 +128,70 @@ def test_demand_scaling_spawns_replicas_for_hot_targets():
         assert transfer.status == TransferStatus.COMPLETED
 
 
+def test_replica_seed_runs_after_new_capacity():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        storage_utilization_threshold=0.3,
+        bandwidth_utilization_threshold=0.95,
+        max_replicas_per_root=2,
+        replica_seed_limit=2,
+    )
+
+    sim, network = _build_network(target_storage_gb=1, scaling_config=scaling)
+    hot_file = 400 * 1024 * 1024
+
+    transfer = network.initiate_file_transfer("node-a", "node-b", "hot.bin", hot_file)
+    assert transfer is not None
+    sim.run()
+    assert transfer.status == TransferStatus.COMPLETED
+
+    second_transfer = network.initiate_file_transfer("node-a", "node-b", "followup.bin", hot_file)
+    assert second_transfer is not None
+    sim.run()
+
+    cluster_nodes = network.get_cluster_nodes("node-b")
+    replicas = [node_id for node_id in cluster_nodes if node_id != "node-b"]
+    assert replicas  # scaling should have spawned at least one replica
+    replica_node_id = replicas.pop()
+    replica = network.nodes[replica_node_id]
+    assert any(file_transfer.file_name == "hot.bin" for file_transfer in replica.stored_files.values())
+
+
+def test_scaling_uses_telemetry_priorities():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        storage_utilization_threshold=0.6,
+        bandwidth_utilization_threshold=0.9,
+        os_failure_threshold=1,
+        trigger_priority=["os_failures", "storage", "bandwidth"],
+    )
+
+    sim, network = _build_network(scaling_config=scaling)
+    target = network.nodes["node-b"]
+    original_complete = target.disk.complete_write
+    failure_state = {"raised": False}
+
+    def failing_complete(self, *args, **kwargs):
+        failure_state["raised"] = True
+        raise RuntimeError("disk offline")
+
+    target.disk.complete_write = types.MethodType(failing_complete, target.disk)
+
+    try:
+        transfer = network.initiate_file_transfer("node-a", "node-b", "fail.bin", 50 * 1024 * 1024)
+        assert transfer is not None
+        sim.run()
+    finally:
+        target.disk.complete_write = original_complete
+
+    assert failure_state["raised"]
+
+    replicas = [node_id for node_id in network.get_cluster_nodes("node-b") if node_id != "node-b"]
+    if replicas:
+        trigger = network.get_last_scaling_trigger(replicas[0])
+        assert trigger == "os_failures"
+
+
 def test_multi_hop_routing_selects_lowest_latency_path():
     sim = Simulator()
     network = StorageVirtualNetwork(sim, tick_interval=0.005)

@@ -45,6 +45,18 @@ class PendingChunkCommit:
     completion_time: float
     bandwidth_bps: float
 
+
+@dataclass
+class NodeTelemetry:
+    node_id: str
+    storage_ratio: float
+    bandwidth_ratio: float
+    os_memory_ratio: float
+    os_failure_delta: int
+    used_bytes: int
+    reserved_bytes: int
+    timestamp: float
+
 @dataclass
 class DemandScalingConfig:
     enabled: bool = False
@@ -55,6 +67,8 @@ class DemandScalingConfig:
     replica_bandwidth_factor: float = 1.0
     os_failure_threshold: Optional[int] = None
     os_memory_utilization_threshold: Optional[float] = None
+    trigger_priority: Optional[List[str]] = None
+    replica_seed_limit: Optional[int] = None
 
 
 class StorageVirtualNetwork:
@@ -82,6 +96,9 @@ class StorageVirtualNetwork:
         self.chunk_bandwidths: Dict[ChunkKey, float] = defaultdict(float)
         self._tick_scheduled = False
         self._pending_disk_commits: Dict[ChunkKey, PendingChunkCommit] = {}
+        self.node_telemetry: Dict[str, NodeTelemetry] = {}
+        self._last_scaling_trigger: Dict[str, str] = {}
+        self._replica_parents: Dict[str, str] = {}
 
         # Replica/cluster bookkeeping for decentralized scaling
         self.node_roots: Dict[str, str] = {}
@@ -98,7 +115,8 @@ class StorageVirtualNetwork:
         """Add a node to the network"""
         if not getattr(node, "ip_address", None):
             node.ip_address = self._allocate_ip()
-        node.attach_simulator(self.simulator)
+        if hasattr(node, "attach_simulator"):
+            node.attach_simulator(self.simulator)
         self.nodes[node.node_id] = node
         self._register_node_cluster(node.node_id, root_id)
         self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
@@ -267,6 +285,15 @@ class StorageVirtualNetwork:
     def get_cluster_nodes(self, node_id: str) -> Set[str]:
         """Return the cluster (root + replicas) for a given node id."""
         return set(self._get_cluster_nodes(node_id))
+
+    def get_node_telemetry(self, node_id: str) -> Optional[NodeTelemetry]:
+        return self.node_telemetry.get(node_id)
+
+    def get_last_scaling_trigger(self, node_id: str) -> Optional[str]:
+        return self._last_scaling_trigger.get(node_id)
+
+    def get_replica_parent(self, replica_id: str) -> Optional[str]:
+        return self._replica_parents.get(replica_id)
 
     def get_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
         """Expose the currently computed routing path for testing/inspection."""
@@ -460,6 +487,13 @@ class StorageVirtualNetwork:
             self.node_roots[root] = root
         return self.cluster_nodes.get(root, set())
 
+    def _get_replica_children(self, parent_id: str) -> List[str]:
+        return [replica_id for replica_id, recorded_parent in self._replica_parents.items() if recorded_parent == parent_id]
+
+    def _update_replica_triggers(self, parent_id: str, trigger: str) -> None:
+        for replica_id in self._get_replica_children(parent_id):
+            self._last_scaling_trigger[replica_id] = trigger
+
     def _select_storage_node(self, requested_node_id: str, required_size: Optional[int] = None) -> Optional[str]:
         candidates = [
             self.nodes[node_id]
@@ -485,6 +519,75 @@ class StorageVirtualNetwork:
 
         eligible.sort(key=projected_usage_ratio)
         return eligible[0].node_id
+
+    def _collect_node_telemetry(self, node: StorageVirtualNode) -> NodeTelemetry:
+        projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else node.used_storage
+        storage_ratio = (projected / node.total_storage) if node.total_storage else 0.0
+        bandwidth_ratio = (node.network_utilization / node.bandwidth) if node.bandwidth else 0.0
+        os_memory_ratio = (
+            node.virtual_os.used_memory / node.memory_capacity_bytes
+            if getattr(node, "memory_capacity_bytes", 0) else 0.0
+        )
+        baseline = self._os_failure_baseline.get(node.node_id, 0)
+        os_failure_delta = node.os_process_failures - baseline
+        reserved_bytes = 0
+        if hasattr(node, "disk") and hasattr(node.disk, "reserved_bytes"):
+            reserved_bytes = node.disk.reserved_bytes
+        telemetry = NodeTelemetry(
+            node_id=node.node_id,
+            storage_ratio=storage_ratio,
+            bandwidth_ratio=bandwidth_ratio,
+            os_memory_ratio=os_memory_ratio,
+            os_failure_delta=os_failure_delta,
+            used_bytes=node.used_storage,
+            reserved_bytes=reserved_bytes,
+            timestamp=self.simulator.now,
+        )
+        self.node_telemetry[node.node_id] = telemetry
+        return telemetry
+
+    def _cause_ratio(self, telemetry: NodeTelemetry, cause: str) -> float:
+        if cause == "storage":
+            return telemetry.storage_ratio
+        if cause == "bandwidth":
+            return telemetry.bandwidth_ratio
+        if cause == "os_memory":
+            return telemetry.os_memory_ratio
+        if cause == "os_failures":
+            return float(max(0, telemetry.os_failure_delta))
+        return 0.0
+
+    def _node_overload_cause(self, node: StorageVirtualNode) -> Optional[Tuple[str, NodeTelemetry]]:
+        if not self.scaling.enabled:
+            return None
+        telemetry = self._collect_node_telemetry(node)
+        breaches: Dict[str, NodeTelemetry] = {}
+
+        if telemetry.storage_ratio >= self.scaling.storage_utilization_threshold:
+            breaches["storage"] = telemetry
+        if telemetry.bandwidth_ratio >= self.scaling.bandwidth_utilization_threshold:
+            breaches["bandwidth"] = telemetry
+        if (
+            self.scaling.os_memory_utilization_threshold is not None
+            and telemetry.os_memory_ratio >= self.scaling.os_memory_utilization_threshold
+        ):
+            breaches["os_memory"] = telemetry
+
+        if self.scaling.os_failure_threshold is not None:
+            baseline = self._os_failure_baseline.get(node.node_id, 0)
+            if telemetry.os_failure_delta >= self.scaling.os_failure_threshold:
+                self._os_failure_baseline[node.node_id] = node.os_process_failures
+                breaches["os_failures"] = telemetry
+
+        if not breaches:
+            return None
+
+        priority = self.scaling.trigger_priority or ["storage", "bandwidth", "os_memory", "os_failures"]
+        for cause in priority:
+            if cause in breaches:
+                return cause, breaches[cause]
+        cause, telem = next(iter(breaches.items()))
+        return cause, telem
 
     def _ensure_target_capacity(self, requested_node_id: str, file_size: int) -> Optional[str]:
         target_id = self._select_storage_node(requested_node_id, file_size)
@@ -524,6 +627,7 @@ class StorageVirtualNetwork:
             bandwidth_factor=self.scaling.replica_bandwidth_factor,
         )
         self.add_node(replica, root_id=root_id)
+        self._replica_parents[replica_id] = reference_node_id
 
         for neighbor_id, bandwidth_bps in reference_node.connections.items():
             if neighbor_id not in self.nodes:
@@ -534,50 +638,93 @@ class StorageVirtualNetwork:
 
         parent_link_bandwidth = max(1, int(reference_node.bandwidth / 1000000))
         self.connect_nodes(replica_id, reference_node.node_id, bandwidth=parent_link_bandwidth, latency_ms=1.0)
+        self._schedule_replica_seed(reference_node_id, replica_id)
         return replica_id
 
-    def _is_node_overloaded(self, node: StorageVirtualNode) -> bool:
-        if not self.scaling.enabled:
-            return False
-        projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else node.used_storage
-        storage_ratio = (projected / node.total_storage) if node.total_storage else 0.0
-        bandwidth_ratio = (node.network_utilization / node.bandwidth) if node.bandwidth else 0.0
-        os_memory_ratio = (
-            node.virtual_os.used_memory / node.memory_capacity_bytes
-            if getattr(node, "memory_capacity_bytes", 0) else 0.0
-        )
+    def _schedule_replica_seed(self, source_node_id: str, replica_id: str, attempt: int = 0) -> None:
+        if self.scaling.replica_seed_limit == 0:
+            return
+        source_node = self.nodes.get(source_node_id)
+        replica_node = self.nodes.get(replica_id)
+        if not source_node or not replica_node:
+            return
+        stored_files = list(source_node.stored_files.values())
+        if not stored_files:
+            if attempt < 5:
+                self.simulator.schedule_in(
+                    0.05,
+                    self._schedule_replica_seed,
+                    source_node_id,
+                    replica_id,
+                    attempt + 1,
+                )
+            return
+        replica_backing_ids = {
+            transfer.backing_file_id or transfer.file_id
+            for transfer in replica_node.stored_files.values()
+        }
+        seed_limit = self.scaling.replica_seed_limit or len(stored_files)
+        seeded = 0
+        for transfer in stored_files:
+            if seeded >= seed_limit:
+                break
+            if transfer.file_id in replica_backing_ids:
+                continue
+            route = self._compute_route(source_node_id, replica_id)
+            if not route or len(route) < 2:
+                continue
+            replica_transfer = self.initiate_replica_transfer(source_node_id, replica_id, transfer.file_id)
+            if replica_transfer:
+                seeded += 1
 
-        if storage_ratio >= self.scaling.storage_utilization_threshold:
-            return True
-        if bandwidth_ratio >= self.scaling.bandwidth_utilization_threshold:
-            return True
-        if (
-            self.scaling.os_memory_utilization_threshold is not None
-            and os_memory_ratio >= self.scaling.os_memory_utilization_threshold
-        ):
-            return True
-
-        if self.scaling.os_failure_threshold is not None:
-            baseline = self._os_failure_baseline.get(node.node_id, 0)
-            recent_failures = node.os_process_failures - baseline
-            if recent_failures >= self.scaling.os_failure_threshold:
-                self._os_failure_baseline[node.node_id] = node.os_process_failures
-                return True
-
-        return False
+    def _is_node_overloaded(self, node: StorageVirtualNode) -> Tuple[bool, Optional[str], Optional[NodeTelemetry]]:
+        cause = self._node_overload_cause(node)
+        if cause is None:
+            return False, None, None
+        trigger, telemetry = cause
+        return True, trigger, telemetry
 
     def _maybe_expand_cluster(self, node_id: str) -> None:
         if not self.scaling.enabled or node_id not in self.nodes:
             return
         root_id = self._get_root_id(node_id)
         cluster = self._get_cluster_nodes(root_id)
-        if len(cluster) - 1 >= self.scaling.max_replicas_per_root:
-            return
-        overloaded = [self.nodes[nid] for nid in cluster if nid in self.nodes and self._is_node_overloaded(self.nodes[nid])]
+        at_capacity = (len(cluster) - 1) >= self.scaling.max_replicas_per_root
+        overloaded: List[Tuple[StorageVirtualNode, Optional[str], Optional[NodeTelemetry]]] = []
+        for nid in cluster:
+            node = self.nodes.get(nid)
+            if not node:
+                continue
+            overloaded_flag, trigger, telemetry = self._is_node_overloaded(node)
+            if overloaded_flag:
+                overloaded.append((node, trigger, telemetry))
         if not overloaded:
             return
-        overloaded.sort(key=lambda n: n.network_utilization, reverse=True)
-        self._spawn_replica_node(overloaded[0].node_id)
+        trigger_priority = self.scaling.trigger_priority or ["storage", "bandwidth", "os_memory", "os_failures"]
+
+        def priority_index(trigger: Optional[str]) -> int:
+            if trigger is None:
+                return len(trigger_priority) + 1
+            try:
+                return trigger_priority.index(trigger)
+            except ValueError:
+                return len(trigger_priority)
+
+        overloaded.sort(
+            key=lambda entry: (
+                priority_index(entry[1]),
+                -self._cause_ratio(entry[2], entry[1] or ""),
+                -entry[0].network_utilization,
+            ),
+        )
+        winner, trigger, telemetry = overloaded[0]
+        if at_capacity:
+            if trigger:
+                self._update_replica_triggers(winner.node_id, trigger)
+            return
+        replica_id = self._spawn_replica_node(winner.node_id)
+        if replica_id:
+            self._last_scaling_trigger[replica_id] = trigger or "unknown"
 
     def _schedule_next_chunk(
         self,
@@ -768,6 +915,7 @@ class StorageVirtualNetwork:
                 reason="Disk commit failed",
             )
             self.transfer_operations[pending.source].pop(pending.transfer.file_id, None)
+            self._maybe_expand_cluster(pending.target)
             return
 
         self._emit_event(
@@ -932,3 +1080,5 @@ class StorageVirtualNetwork:
 
         if file_id in self.transfer_operations[source_node_id]:
             del self.transfer_operations[source_node_id][file_id]
+        for replica_id in self._get_replica_children(target_node_id):
+            self._schedule_replica_seed(target_node_id, replica_id)
