@@ -278,12 +278,12 @@ def test_disk_failures_increment_os_process_counters():
     sim, network = _build_network()
     target_node = network.nodes["node-b"]
 
-    original_write = target_node.disk.write_chunk
+    original_complete = target_node.disk.complete_write
 
-    def failing_write(self, *args, **kwargs):
+    def failing_complete(self, *args, **kwargs):
         raise RuntimeError("disk offline")
 
-    target_node.disk.write_chunk = types.MethodType(failing_write, target_node.disk)
+    target_node.disk.complete_write = types.MethodType(failing_complete, target_node.disk)
 
     try:
         transfer = network.initiate_file_transfer("node-a", "node-b", "disk-fail.bin", 10 * 1024 * 1024)
@@ -293,7 +293,7 @@ def test_disk_failures_increment_os_process_counters():
         assert transfer.status == TransferStatus.FAILED
         assert target_node.os_process_failures >= 1
     finally:
-        target_node.disk.write_chunk = original_write
+        target_node.disk.complete_write = original_complete
 
 
 def test_demand_scaling_triggers_on_os_failures():
@@ -307,19 +307,19 @@ def test_demand_scaling_triggers_on_os_failures():
     sim, network = _build_network(scaling_config=scaling)
     target_node = network.nodes["node-b"]
 
-    original_write = target_node.disk.write_chunk
+    original_complete = target_node.disk.complete_write
 
-    def failing_write(self, *args, **kwargs):
+    def failing_complete(self, *args, **kwargs):
         raise RuntimeError("disk offline")
 
-    target_node.disk.write_chunk = types.MethodType(failing_write, target_node.disk)
+    target_node.disk.complete_write = types.MethodType(failing_complete, target_node.disk)
 
     try:
         transfer = network.initiate_file_transfer("node-a", "node-b", "os-scale.bin", 20 * 1024 * 1024)
         assert transfer is not None
         sim.run()
     finally:
-        target_node.disk.write_chunk = original_write
+        target_node.disk.complete_write = original_complete
 
     assert network.nodes["node-b"].os_process_failures >= 1
     cluster_nodes = network.get_cluster_nodes("node-b")
@@ -408,6 +408,48 @@ def test_demand_scaling_triggers_on_os_memory_pressure():
     source_cluster = network.get_cluster_nodes("node-a")
     target_cluster = network.get_cluster_nodes("node-b")
     assert len(source_cluster) >= 2 or len(target_cluster) >= 2
+
+
+def test_disk_latency_extends_transfer_completion():
+    sim, network = _build_network()
+    target = network.nodes["node-b"]
+    target.disk_profile.throughput_bytes_per_sec = 5 * 1024 * 1024  # ~5MB/s
+    target.disk_profile.seek_time_ms = 20
+
+    transfer = network.initiate_file_transfer("node-a", "node-b", "slow-disk.bin", 20 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run()
+
+    assert transfer.status == TransferStatus.COMPLETED
+    duration = transfer.completed_at - transfer.created_at
+    assert duration >= 0.5  # slower disk should noticeably delay completion
+
+
+def test_corrupted_chunks_require_recovery_before_replication():
+    sim, network = _build_network()
+    seed_transfer = network.initiate_file_transfer("node-a", "node-b", "seed.bin", 10 * 1024 * 1024)
+    assert seed_transfer is not None
+    sim.run()
+
+    node_b = network.nodes["node-b"]
+    stored_file_id = next(iter(node_b.stored_files))
+    node_b.disk.inject_corruption(stored_file_id, 0)
+
+    node_c = StorageVirtualNode("node-c", 4, 16, 500, BANDWIDTH_MBPS)
+    network.add_node(node_c)
+    network.connect_nodes("node-b", "node-c", bandwidth=BANDWIDTH_MBPS)
+
+    replica_transfer = network.initiate_replica_transfer("node-b", "node-c", stored_file_id)
+    assert replica_transfer is not None
+    sim.run()
+    assert replica_transfer.status == TransferStatus.FAILED
+
+    node_b.disk.recover_chunk(stored_file_id, 0)
+    retry = network.initiate_replica_transfer("node-b", "node-c", stored_file_id)
+    assert retry is not None
+    sim.run()
+    assert retry.status == TransferStatus.COMPLETED
 
 
 def test_network_device_reservation_limits_concurrent_transmissions():

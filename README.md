@@ -48,6 +48,9 @@ The suite currently includes:
 - Aborted transfers automatically release their reservations, while successful transfers retain their on-disk chunks for later retrieval or replication.
 - Disk writes now execute inside VirtualOS-managed processes, so storage failures surface as OS process errors and consume CPU/RAM budgets just like network activity.
 - Disk retrievals also run through the VirtualOS layer; attempts to read from offline disks or exhausted memory pools fail fast before a transfer is assembled.
+- Asynchronous I/O scheduling simulates seek + throughput costs per operation; every chunk write obtains a `DiskIOTicket`, and the network only marks a chunk complete once the disk commit event fires at its scheduled simulator timestamp.
+- `VirtualDisk` tracks optional filesystem metadata via `reserve_file(..., path="/node/file.bin")` and can list directories or persist bytes to a host folder when `persist_root` is configured.
+- Integrity hooks expose `inject_corruption`, checksum verification on reads, and `recover_chunk` helpers so tests can model bitrot and recovery workflows before replica transfers proceed.
 
 ## Routing & IP Simulation
 

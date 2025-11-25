@@ -34,6 +34,17 @@ class ActiveChunk:
     def on_last_hop(self) -> bool:
         return self.hop_index >= len(self.path) - 2
 
+
+@dataclass
+class PendingChunkCommit:
+    chunk_key: ChunkKey
+    source: str
+    target: str
+    transfer: FileTransfer
+    chunk: FileChunk
+    completion_time: float
+    bandwidth_bps: float
+
 @dataclass
 class DemandScalingConfig:
     enabled: bool = False
@@ -70,6 +81,7 @@ class StorageVirtualNetwork:
         self.node_active_chunks: Dict[str, Set[ChunkKey]] = defaultdict(set)
         self.chunk_bandwidths: Dict[ChunkKey, float] = defaultdict(float)
         self._tick_scheduled = False
+        self._pending_disk_commits: Dict[ChunkKey, PendingChunkCommit] = {}
 
         # Replica/cluster bookkeeping for decentralized scaling
         self.node_roots: Dict[str, str] = {}
@@ -86,6 +98,7 @@ class StorageVirtualNetwork:
         """Add a node to the network"""
         if not getattr(node, "ip_address", None):
             node.ip_address = self._allocate_ip()
+        node.attach_simulator(self.simulator)
         self.nodes[node.node_id] = node
         self._register_node_cluster(node.node_id, root_id)
         self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
@@ -679,7 +692,7 @@ class StorageVirtualNetwork:
         self._remove_chunk_state(chunk_key, state)
 
         target_node = self.nodes[state.target]
-        success = target_node.process_chunk_transfer(
+        result = target_node.process_chunk_transfer(
             state.transfer.file_id,
             state.chunk.chunk_id,
             state.source,
@@ -687,7 +700,7 @@ class StorageVirtualNetwork:
             bandwidth_used_bps=bandwidth_bps,
         )
 
-        if not success:
+        if not result.success:
             state.transfer.status = TransferStatus.FAILED
             self._emit_event(
                 "transfer_failed",
@@ -699,19 +712,81 @@ class StorageVirtualNetwork:
             self.transfer_operations[state.source].pop(state.transfer.file_id, None)
             target_node.abort_transfer(state.transfer.file_id)
             return
+        self._schedule_chunk_commit(chunk_key, state, result.completion_time, bandwidth_bps)
+
+    def _schedule_chunk_commit(
+        self,
+        chunk_key: ChunkKey,
+        state: ActiveChunk,
+        completion_time: float,
+        bandwidth_bps: float,
+    ) -> None:
+        pending = PendingChunkCommit(
+            chunk_key=chunk_key,
+            source=state.source,
+            target=state.target,
+            transfer=state.transfer,
+            chunk=state.chunk,
+            completion_time=completion_time,
+            bandwidth_bps=bandwidth_bps,
+        )
+        self._pending_disk_commits[chunk_key] = pending
+        if completion_time <= self.simulator.now:
+            self._complete_chunk_commit_event(chunk_key)
+        else:
+            self.simulator.schedule_at(completion_time, self._complete_chunk_commit_event, chunk_key)
+
+    def _complete_chunk_commit_event(self, chunk_key: ChunkKey) -> None:
+        pending = self._pending_disk_commits.pop(chunk_key, None)
+        if not pending:
+            return
+        target_node = self.nodes.get(pending.target)
+        if not target_node:
+            pending.transfer.status = TransferStatus.FAILED
+            self._emit_event(
+                "transfer_failed",
+                file_id=pending.transfer.file_id,
+                source=pending.source,
+                target=pending.target,
+                reason="Target node unavailable during disk commit",
+            )
+            self.transfer_operations[pending.source].pop(pending.transfer.file_id, None)
+            return
+
+        success = target_node.finalize_chunk_commit(
+            pending.transfer.file_id,
+            pending.chunk.chunk_id,
+            completed_time=self.simulator.now,
+        )
+        if not success:
+            pending.transfer.status = TransferStatus.FAILED
+            self._emit_event(
+                "transfer_failed",
+                file_id=pending.transfer.file_id,
+                source=pending.source,
+                target=pending.target,
+                reason="Disk commit failed",
+            )
+            self.transfer_operations[pending.source].pop(pending.transfer.file_id, None)
+            return
 
         self._emit_event(
             "chunk_completed",
-            file_id=state.transfer.file_id,
-            chunk_id=state.chunk.chunk_id,
-            source=state.source,
-            target=state.target,
+            file_id=pending.transfer.file_id,
+            chunk_id=pending.chunk.chunk_id,
+            source=pending.source,
+            target=pending.target,
         )
 
-        if state.transfer.status == TransferStatus.COMPLETED:
-            self._finalize_transfer(state.source, state.target, state.transfer.file_id, state.transfer)
+        if pending.transfer.status == TransferStatus.COMPLETED:
+            self._finalize_transfer(
+                pending.source,
+                pending.target,
+                pending.transfer.file_id,
+                pending.transfer,
+            )
         else:
-            self._schedule_next_chunk(state.source, state.target, state.transfer.file_id)
+            self._schedule_next_chunk(pending.source, pending.target, pending.transfer.file_id)
 
     def _fail_active_chunk(self, chunk_key: ChunkKey, reason: Optional[str]) -> None:
         state = self.active_chunks.get(chunk_key)
@@ -781,6 +856,18 @@ class StorageVirtualNetwork:
                 continue
             if node_id in state.path:
                 self._reroute_or_fail_chunk(chunk_key, reason=f"Node {node_id} failed")
+        for chunk_key, pending in list(self._pending_disk_commits.items()):
+            if pending.source == node_id or pending.target == node_id:
+                self._pending_disk_commits.pop(chunk_key, None)
+                pending.transfer.status = TransferStatus.FAILED
+                self._emit_event(
+                    "transfer_failed",
+                    file_id=pending.transfer.file_id,
+                    source=pending.source,
+                    target=pending.target,
+                    reason=f"Node {node_id} failed during disk commit",
+                )
+                self.transfer_operations[pending.source].pop(pending.transfer.file_id, None)
 
     def _reroute_or_fail_chunk(self, chunk_key: ChunkKey, reason: str) -> None:
         state = self.active_chunks.get(chunk_key)

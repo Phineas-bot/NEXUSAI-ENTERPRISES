@@ -1,12 +1,15 @@
 import math
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 from enum import Enum, auto
 import hashlib
 
-from virtual_disk import VirtualDisk
+from virtual_disk import DiskCorruptionError, DiskIOProfile, DiskIOTicket, VirtualDisk
 from virtual_os import ProcessState, VirtualOS, SyscallContext, SyscallResult
+
+if TYPE_CHECKING:  # pragma: no cover
+    from simulator import Simulator
 
 class TransferStatus(Enum):
     PENDING = auto()
@@ -47,6 +50,21 @@ class NetworkInterface:
     metrics: Dict[str, Union[int, float]] = field(default_factory=dict)
 
 
+@dataclass
+class ChunkCommitResult:
+    success: bool
+    completion_time: float
+
+
+@dataclass
+class PendingDiskWrite:
+    ticket: DiskIOTicket
+    chunk: "FileChunk"
+    transfer: "FileTransfer"
+    source_node: str
+    bandwidth_bps: float
+
+
 class StorageVirtualNode:
     _CPU_SECONDS_PER_MB = 0.002  # Tunable constant representing CPU seconds needed per MB processed
     _WORKING_SET_FRACTION = 0.05  # Percent of total memory to reserve per active chunk (capped by chunk size)
@@ -74,7 +92,9 @@ class StorageVirtualNode:
         self.active_transfers: Dict[str, FileTransfer] = {}
         self.stored_files: Dict[str, FileTransfer] = {}
         self.network_utilization = 0  # Current bandwidth usage
-        self.disk = VirtualDisk(self.total_storage)
+        self.disk_profile = DiskIOProfile()
+        self.disk = VirtualDisk(self.total_storage, io_profile=self.disk_profile)
+        self.simulator: Optional[Simulator] = None
         self.virtual_os = VirtualOS(
             cpu_capacity=max(1, self.cpu_capacity),
             memory_capacity_bytes=self.memory_capacity_bytes,
@@ -96,11 +116,15 @@ class StorageVirtualNode:
         
         # Network connections (node_id: bandwidth_available)
         self.connections: Dict[str, int] = {}
+        self._pending_disk_writes: Dict[Tuple[str, int], PendingDiskWrite] = {}
 
     def add_connection(self, node_id: str, bandwidth: int, latency_ms: float = 0.0):
         """Add a network connection to another node"""
         self.connections[node_id] = bandwidth * 1000000  # Store in bits per second
         self.link_latencies[node_id] = max(0.0, latency_ms)
+
+    def attach_simulator(self, simulator: "Simulator") -> None:
+        self.simulator = simulator
 
     def get_link_latency(self, node_id: str) -> float:
         return self.link_latencies.get(node_id, 0.0)
@@ -180,7 +204,8 @@ class StorageVirtualNode:
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
         # Reserve disk capacity ahead of time so transfers cannot overcommit storage
-        if not self.disk.reserve_file(file_id, file_size):
+        file_path = f"/{self.node_id}/{file_name}"
+        if not self.disk.reserve_file(file_id, file_size, path=file_path):
             return None
         
         # Create file transfer record
@@ -202,51 +227,78 @@ class StorageVirtualNode:
         chunk_id: int,
         source_node: str,
         completed_time: float,
-        bandwidth_used_bps: int
-    ) -> bool:
-        """Process an incoming file chunk"""
+        bandwidth_used_bps: int,
+    ) -> ChunkCommitResult:
+        """Process an incoming file chunk and return its disk commit schedule."""
         if file_id not in self.active_transfers:
-            return False
-        
+            return ChunkCommitResult(False, completed_time)
+
         transfer = self.active_transfers[file_id]
-        
+
         try:
             chunk = next(c for c in transfer.chunks if c.chunk_id == chunk_id)
         except StopIteration:
-            return False
-        
+            return ChunkCommitResult(False, completed_time)
+
         chunk.stored_node = self.node_id
         chunk.status = TransferStatus.IN_PROGRESS
 
-        def commit_chunk() -> None:
-            result = self.virtual_os.invoke_syscall(
-                "disk_write",
-                file_id=file_id,
-                chunk_id=chunk_id,
-                size=chunk.size,
-            )
-            if not result.success:
-                raise RuntimeError(result.error or "disk-write-failed")
+        if not self._execute_chunk_process(chunk.size, purpose="ingest", work=None):
+            self.abort_transfer(file_id)
+            return ChunkCommitResult(False, completed_time)
 
-        # Simulate CPU/memory consumption through the virtual OS (includes disk commit)
-        if not self._execute_chunk_process(chunk.size, purpose="ingest", work=commit_chunk):
+        try:
+            ticket = self.disk.schedule_write(
+                file_id,
+                chunk_id,
+                chunk.size,
+                current_time=completed_time,
+            )
+        except Exception:
+            self.abort_transfer(file_id)
+            return ChunkCommitResult(False, completed_time)
+
+        self._pending_disk_writes[(file_id, chunk_id)] = PendingDiskWrite(
+            ticket=ticket,
+            chunk=chunk,
+            transfer=transfer,
+            source_node=source_node,
+            bandwidth_bps=float(bandwidth_used_bps),
+        )
+        return ChunkCommitResult(True, ticket.completion_time)
+
+    def finalize_chunk_commit(
+        self,
+        file_id: str,
+        chunk_id: int,
+        *,
+        completed_time: float,
+    ) -> bool:
+        pending = self._pending_disk_writes.pop((file_id, chunk_id), None)
+        if not pending:
+            return False
+        try:
+            self.disk.complete_write(pending.ticket, data=None)
+        except DiskCorruptionError:
+            self.os_process_failures += 1
+            self.abort_transfer(file_id)
+            return False
+        except Exception:
+            self.os_process_failures += 1
             self.abort_transfer(file_id)
             return False
 
-        chunk.status = TransferStatus.COMPLETED
-        
-        # Update metrics
+        pending.chunk.status = TransferStatus.COMPLETED
+        transfer = pending.transfer
         transfer.status = TransferStatus.IN_PROGRESS
-        self.total_data_transferred += chunk.size
-        
-        # Check if all chunks are completed
+        self.total_data_transferred += pending.chunk.size
+
         if all(c.status == TransferStatus.COMPLETED for c in transfer.chunks):
             transfer.status = TransferStatus.COMPLETED
             transfer.completed_at = completed_time
             self.stored_files[file_id] = transfer
-            del self.active_transfers[file_id]
+            self.active_transfers.pop(file_id, None)
             self.total_requests_processed += 1
-        
         return True
 
     def abort_transfer(self, file_id: str) -> None:
@@ -255,6 +307,12 @@ class StorageVirtualNode:
         if transfer:
             transfer.status = TransferStatus.FAILED
             self.failed_transfers += 1
+        for key, pending in list(self._pending_disk_writes.items()):
+            pending_file_id, _ = key
+            if pending_file_id != file_id:
+                continue
+            self._pending_disk_writes.pop(key, None)
+            self.disk.cancel_ticket(pending.ticket)
         self.disk.release_file(file_id)
 
     def retrieve_file(
