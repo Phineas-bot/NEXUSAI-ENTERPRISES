@@ -802,6 +802,56 @@ class StorageVirtualNetwork:
                 seeded += 1
                 replica_backing_ids.add(backing_id)
 
+    def _node_has_dataset(self, node_id: str, dataset_id: str) -> bool:
+        node = self.nodes.get(node_id)
+        if not node:
+            return False
+
+        def matches(transfers: Dict[str, FileTransfer]) -> bool:
+            for transfer in transfers.values():
+                backing = transfer.backing_file_id or transfer.file_id
+                if backing == dataset_id:
+                    return True
+            return False
+
+        return matches(node.stored_files) or matches(node.active_transfers)
+
+    def _replicate_across_cluster(self, owner_node_id: str, transfer: FileTransfer) -> None:
+        if transfer.is_retrieval:
+            return
+        owner_node = self.nodes.get(owner_node_id)
+        if not owner_node or owner_node_id in self.failed_nodes:
+            return
+
+        dataset_id = transfer.backing_file_id or transfer.file_id
+        cluster_nodes = [
+            node_id
+            for node_id in self._get_cluster_nodes(owner_node_id)
+            if node_id in self.nodes and node_id not in self.failed_nodes
+        ]
+
+        root_id = self._get_root_id(owner_node_id)
+        if root_id in self.nodes and root_id not in self.failed_nodes and root_id not in cluster_nodes:
+            cluster_nodes.append(root_id)
+        if root_id in cluster_nodes and root_id != owner_node_id:
+            cluster_nodes.remove(root_id)
+            cluster_nodes.insert(0, root_id)
+
+        for node_id in cluster_nodes:
+            if node_id == owner_node_id:
+                continue
+            if self._node_has_dataset(node_id, dataset_id):
+                continue
+            replica_transfer = self.initiate_replica_transfer(owner_node_id, node_id, transfer.file_id)
+            if not replica_transfer:
+                self._emit_event(
+                    "replica_sync_failed",
+                    file_id=transfer.file_id,
+                    dataset_id=dataset_id,
+                    source=owner_node_id,
+                    target=node_id,
+                )
+
     def _is_node_overloaded(self, node: StorageVirtualNode) -> Tuple[bool, Optional[str], Optional[NodeTelemetry]]:
         cause = self._node_overload_cause(node)
         if cause is None:
@@ -1207,6 +1257,9 @@ class StorageVirtualNetwork:
             del self.transfer_operations[source_node_id][file_id]
 
         self._ensure_replica_coverage(target_node_id)
+
+        if not transfer.is_retrieval:
+            self._replicate_across_cluster(target_node_id, transfer)
 
         for replica_id in self._get_replica_children(target_node_id):
             self._schedule_replica_seed(target_node_id, replica_id)

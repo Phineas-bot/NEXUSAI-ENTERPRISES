@@ -71,6 +71,11 @@ def _run_parallel_transfers(file_size: int = FILE_SIZE):
     return transfer_one, transfer_two
 
 
+def _node_has_dataset(network: StorageVirtualNetwork, node_id: str, dataset_id: str) -> bool:
+    node = network.nodes[node_id]
+    return any((t.backing_file_id or t.file_id) == dataset_id for t in node.stored_files.values())
+
+
 def test_chunk_strategy_scales_with_bandwidth():
     large_file = 200 * 1024 * 1024
     _, fast_network = _build_network(bandwidth_mbps=2000)
@@ -507,6 +512,52 @@ def test_replica_transfer_handles_disk_read_failures():
         assert replica_transfer.file_id not in node_c.stored_files
     finally:
         node_b.disk.read_chunk = original_read
+
+
+def test_completed_transfer_fanouts_to_cluster_replicas():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        auto_replication_enabled=True,
+        min_replicas_per_root=2,
+        max_replicas_per_root=2,
+    )
+
+    sim, network = _build_network(scaling_config=scaling)
+    cluster = network.get_cluster_nodes("node-b")
+    assert len(cluster) == 3
+
+    transfer = network.initiate_file_transfer("node-a", "node-b", "cluster-sync.bin", 60 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run()
+
+    dataset_id = transfer.file_id
+    for node_id in cluster:
+        assert _node_has_dataset(network, node_id, dataset_id)
+
+
+def test_transfer_to_replica_backfills_parent_and_siblings():
+    scaling = DemandScalingConfig(
+        enabled=True,
+        auto_replication_enabled=True,
+        min_replicas_per_root=2,
+        max_replicas_per_root=2,
+    )
+
+    sim, network = _build_network(scaling_config=scaling)
+    cluster = sorted(network.get_cluster_nodes("node-b"))
+    replicas = [node_id for node_id in cluster if node_id != "node-b"]
+    assert len(replicas) >= 2
+    target_replica = replicas[0]
+
+    transfer = network.initiate_file_transfer("node-a", target_replica, "replica-ingest.bin", 40 * 1024 * 1024)
+    assert transfer is not None
+
+    sim.run()
+
+    dataset_id = transfer.file_id
+    for node_id in cluster:
+        assert _node_has_dataset(network, node_id, dataset_id)
 
 
 def test_demand_scaling_triggers_on_os_memory_pressure():

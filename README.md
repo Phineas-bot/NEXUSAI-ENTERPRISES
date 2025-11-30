@@ -44,13 +44,15 @@ Example session commands:
 ```text
 cloudsim> add node-a --storage 500 --bandwidth 1500
 cloudsim> add node-b --storage 200
-cloudsim> connect node-a node-b --bandwidth 500
+cloudsim> connect node-a node-b node-c --bandwidth 500
 cloudsim> transfer node-a node-b demo.bin 200MB
-cloudsim> nodes
+cloudsim> inspect node-b
+cloudsim> nodes --all
 cloudsim> events 5
 ```
 
 The shell keeps the simulator alive so you can mark nodes offline (`fail node-b`), restore them, disconnect links, or inspect replica clusters in real time. Use `help` or `help <command>` from inside the shell to see the full catalog of actions.
+`connect` accepts more than two node IDs and links each adjacent pair, and `inspect NODE_ID` dumps bandwidth/storage telemetry, stored files, replica parents/children, and active transfers.
 
 ## Bandwidth-Sharing Expectations
 
@@ -63,6 +65,13 @@ The shell keeps the simulator alive so you can mark nodes offline (`fail node-b`
 - Each node belongs to a replica cluster; any member that approaches configurable storage/bandwidth thresholds can clone itself, inheriting connections from its parent and creating a new path for traffic.
 - Replica creation is entirely event-driven—no global controller exists—so saturation on one link or node results in local growth instead of centralized orchestration.
 - `DemandScalingConfig` lets you tune utilization thresholds, replica limits, and resource multipliers; see `tests/test_storage_network.py::test_demand_scaling_spawns_replicas_for_hot_targets` for an example harness.
+
+## Replica Consistency Fan-out
+
+- Every successful transfer now seeds the entire cluster for the destination node: the parent (root) stores the dataset, and all healthy replicas immediately receive scheduled replica transfers.
+- Uploading directly to a replica backfills the parent and the sibling replicas using `initiate_replica_transfer`, so clients can write to any cluster member without thinking about data placement.
+- Replica fan-out uses the same VirtualOS-guarded transfer path as external uploads, ensuring disk bandwidth, CPU, and memory limits are honored during synchronization. Failures raise `replica_sync_failed` events so tests can assert retry behavior.
+- Regression coverage lives in `tests/test_storage_network.py::test_completed_transfer_fanouts_to_cluster_replicas` and `::test_transfer_to_replica_backfills_parent_and_siblings`.
 
 ## Disk-Backed Storage
 
