@@ -100,7 +100,7 @@ class CloudSimController:
         self,
         node_id: str,
         *,
-        storage_gb: int = 500,
+        storage_gb: Optional[float] = None,
         bandwidth_mbps: int = 1000,
         cpu_capacity: int = 8,
         memory_capacity: int = 32,
@@ -110,6 +110,9 @@ class CloudSimController:
         if node_id in self.network.nodes:
             raise ValueError(f"Node '{node_id}' already exists")
         zone = zone or self._random_zone()
+        if storage_gb is None:
+            storage_mb = self._rng.randint(30, 50)
+            storage_gb = max(storage_mb / 1024.0, 0.03)
         node = StorageVirtualNode(
             node_id,
             cpu_capacity=cpu_capacity,
@@ -187,6 +190,50 @@ class CloudSimController:
         if not transfer:
             raise RuntimeError("Transfer could not be started (insufficient capacity or invalid route)")
         return transfer
+
+    def push_file(
+        self,
+        source_node_id: str,
+        file_name: str,
+        size_bytes: int,
+        *,
+        prefer_local: bool = False,
+    ) -> Tuple[str, FileTransfer]:
+        result = self.network.ingest_file(source_node_id, file_name, size_bytes, prefer_local=prefer_local)
+        if not result:
+            mode = "locally" if prefer_local else "into the network"
+            raise RuntimeError(f"Unable to store '{file_name}' {mode}; insufficient capacity or routing")
+        target_id, transfer = result
+        return target_id, transfer
+
+    def store_file_locally(self, node_id: str, file_name: str, size_bytes: int) -> FileTransfer:
+        transfer = self.network.store_local_file(node_id, file_name, size_bytes)
+        if not transfer:
+            raise RuntimeError(f"Node '{node_id}' lacks capacity to store '{file_name}' locally")
+        return transfer
+
+    def pull_file(self, target_node_id: str, file_name: str) -> FileTransfer:
+        if target_node_id not in self.network.nodes:
+            raise ValueError(f"Target node '{target_node_id}' does not exist")
+        manifest = self.network.get_file_manifest(file_name)
+        if manifest:
+            transfer = self.network.assemble_file(file_name, target_node_id)
+            if not transfer:
+                raise RuntimeError(f"Unable to assemble '{file_name}' for delivery")
+            return transfer
+        matches = self.network.locate_file(file_name)
+        if not matches:
+            raise RuntimeError(f"No stored copy of '{file_name}' found in the network")
+
+        for node_id, transfer in matches:
+            if node_id == target_node_id:
+                return transfer
+
+        for node_id, transfer in matches:
+            replica_transfer = self.network.initiate_replica_transfer(node_id, target_node_id, transfer.file_id)
+            if replica_transfer:
+                return replica_transfer
+        raise RuntimeError(f"Unable to route '{file_name}' to {target_node_id}; no reachable source found")
 
     def run_until_idle(self) -> None:
         self.simulator.run()

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import hashlib
-from collections import defaultdict
+from collections import defaultdict, deque
 import heapq
 import math
 
@@ -74,6 +74,23 @@ class DemandScalingConfig:
     min_replicas_per_root: int = 0
 
 
+@dataclass
+class FileSegment:
+    node_id: str
+    file_id: str
+    size: int
+    offset: int
+
+
+@dataclass
+class FileManifest:
+    file_name: str
+    master_id: str
+    total_size: int
+    segments: List[FileSegment]
+    created_at: float
+
+
 class StorageVirtualNetwork:
     def __init__(
         self,
@@ -102,6 +119,12 @@ class StorageVirtualNetwork:
         self.node_telemetry: Dict[str, NodeTelemetry] = {}
         self._last_scaling_trigger: Dict[str, str] = {}
         self._replica_parents: Dict[str, str] = {}
+        self.file_manifests: Dict[str, FileManifest] = {}
+        self.file_manifests_by_id: Dict[str, FileManifest] = {}
+        self.segment_manifests: Dict[str, FileManifest] = {}
+        self.file_names: Dict[str, str] = {}
+        self.file_manifests: Dict[str, "FileManifest"] = {}
+        self.file_manifests_by_id: Dict[str, "FileManifest"] = {}
 
         # Replica/cluster bookkeeping for decentralized scaling
         self.node_roots: Dict[str, str] = {}
@@ -207,7 +230,10 @@ class StorageVirtualNetwork:
         source_node_id: str,
         target_node_id: str,
         file_name: str,
-        file_size: int
+        file_size: int,
+        *,
+        backing_file_id: Optional[str] = None,
+        segment_offset: int = 0,
     ) -> Optional[FileTransfer]:
         """Initiate a file transfer between nodes"""
         if source_node_id not in self.nodes or target_node_id not in self.nodes:
@@ -234,6 +260,8 @@ class StorageVirtualNetwork:
             current_time=self.simulator.now,
             source_node=source_node_id,
             preferred_chunk_size=chunk_size,
+            backing_file_id=backing_file_id,
+            segment_offset=segment_offset,
         )
 
         if not transfer and self.scaling.enabled:
@@ -252,10 +280,13 @@ class StorageVirtualNetwork:
                     current_time=self.simulator.now,
                     source_node=source_node_id,
                     preferred_chunk_size=chunk_size,
+                    backing_file_id=backing_file_id,
+                    segment_offset=segment_offset,
                 )
                 effective_target_id = next_target_id
 
         if transfer:
+            self._register_file_aliases(transfer)
             self.transfer_operations[source_node_id][file_id] = transfer
             self._schedule_next_chunk(source_node_id, effective_target_id, file_id, route)
             return transfer
@@ -294,6 +325,7 @@ class StorageVirtualNetwork:
         transfer.is_retrieval = True
         transfer.backing_file_id = file_id
         transfer.created_at = self.simulator.now
+        self._register_file_aliases(transfer)
 
         self.transfer_operations[owner_node_id][transfer.file_id] = transfer
         self._schedule_next_chunk(owner_node_id, target_node_id, transfer.file_id, route)
@@ -340,11 +372,67 @@ class StorageVirtualNetwork:
     def get_replica_children(self, parent_id: str) -> List[str]:
         return self._get_replica_children(parent_id)
 
+    def locate_file(self, file_name: str) -> List[Tuple[str, FileTransfer]]:
+        matches: List[Tuple[str, FileTransfer]] = []
+        if not file_name:
+            return matches
+
+        manifest = self.file_manifests.get(file_name)
+        if manifest:
+            for segment in manifest.segments:
+                node = self.nodes.get(segment.node_id)
+                if not node or segment.node_id in self.failed_nodes:
+                    continue
+                transfer = node.stored_files.get(segment.file_id)
+                if transfer:
+                    matches.append((segment.node_id, transfer))
+            if matches:
+                return matches
+
+        normalized = file_name.lower()
+        for node_id, node in self.nodes.items():
+            if node_id in self.failed_nodes:
+                continue
+            for transfer in node.stored_files.values():
+                backing = transfer.backing_file_id
+                if (
+                    normalized == transfer.file_name.lower()
+                    or file_name == transfer.file_id
+                    or (backing and file_name == backing)
+                ):
+                    matches.append((node_id, transfer))
+
+        def _priority(entry: Tuple[str, FileTransfer]) -> Tuple[int, float]:
+            node_id, stored_transfer = entry
+            root = self._get_root_id(node_id)
+            is_root = 0 if node_id == root else 1
+            completed = stored_transfer.completed_at or float("inf")
+            return (is_root, completed)
+
+        matches.sort(key=_priority)
+        return matches
+
     def get_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
         """Expose the currently computed routing path for testing/inspection."""
         return self._compute_route(source_node_id, target_node_id)
 
+    def _register_file_aliases(self, transfer: FileTransfer) -> None:
+        self.file_names[transfer.file_id] = transfer.file_name
+        backing_id = transfer.backing_file_id
+        if backing_id:
+            self.file_names[backing_id] = transfer.file_name
+
     def _emit_event(self, event_type: str, **payload: Any) -> None:
+        if "file_name" not in payload:
+            lookup_keys = [
+                payload.get("file_id"),
+                payload.get("dataset_id"),
+                payload.get("backing_file_id"),
+            ]
+            for key in lookup_keys:
+                if key and key in self.file_names:
+                    payload["file_name"] = self.file_names[key]
+                    break
         event = {"type": event_type, "time": self.simulator.now, **payload}
         for observer in self.transfer_observers:
             observer(event)
@@ -590,6 +678,27 @@ class StorageVirtualNetwork:
         for replica_id in self._get_replica_children(parent_id):
             self._last_scaling_trigger[replica_id] = trigger
 
+    def _node_projected_usage(self, node: StorageVirtualNode) -> float:
+        if hasattr(node, "projected_storage_usage"):
+            return node.projected_storage_usage  # type: ignore[attr-defined]
+        return node.used_storage + sum(t.total_size for t in node.active_transfers.values())
+
+    def _node_has_capacity(self, node: StorageVirtualNode, required_size: Optional[int]) -> bool:
+        if required_size is None:
+            return True
+        projected = self._node_projected_usage(node)
+        return (projected + required_size) <= node.total_storage
+
+    def _node_free_bytes(self, node_id: str) -> int:
+        node = self.nodes.get(node_id)
+        if not node:
+            return 0
+        return getattr(node, "free_storage", 0)
+
+    def _projected_usage_ratio(self, node: StorageVirtualNode) -> float:
+        projected = self._node_projected_usage(node)
+        return (projected / node.total_storage) if node.total_storage else 0.0
+
     def _select_storage_node(self, requested_node_id: str, required_size: Optional[int] = None) -> Optional[str]:
         candidates = [
             self.nodes[node_id]
@@ -599,22 +708,144 @@ class StorageVirtualNetwork:
         if not candidates:
             return None
 
-        def has_capacity(node: StorageVirtualNode) -> bool:
-            if required_size is None:
-                return True
-            projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else (node.used_storage + sum(t.total_size for t in node.active_transfers.values()))
-            return (projected + required_size) <= node.total_storage
-
-        eligible = [node for node in candidates if has_capacity(node)]
+        eligible = [node for node in candidates if self._node_has_capacity(node, required_size)]
         if not eligible:
             return None
 
-        def projected_usage_ratio(node: StorageVirtualNode) -> float:
-            projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else (node.used_storage + sum(t.total_size for t in node.active_transfers.values()))
-            return (projected / node.total_storage) if node.total_storage else 0.0
-
-        eligible.sort(key=projected_usage_ratio)
+        eligible.sort(key=self._projected_usage_ratio)
         return eligible[0].node_id
+
+    def _reachable_nodes(self, source_node_id: str) -> Set[str]:
+        if source_node_id not in self.nodes or source_node_id in self.failed_nodes:
+            return set()
+        visited: Set[str] = set()
+        queue: deque[str] = deque([source_node_id])
+        while queue:
+            node_id = queue.popleft()
+            if node_id in visited or node_id in self.failed_nodes:
+                continue
+            visited.add(node_id)
+            node = self.nodes.get(node_id)
+            if not node:
+                continue
+            for neighbor_id in node.connections.keys():
+                if neighbor_id in visited or neighbor_id in self.failed_nodes:
+                    continue
+                if self._is_link_failed(node_id, neighbor_id):
+                    continue
+                queue.append(neighbor_id)
+        return visited
+
+    def _select_ingest_target(self, source_node_id: str, file_size: int, exclude: Optional[Set[str]] = None) -> Optional[str]:
+        reachable = self._reachable_nodes(source_node_id)
+        if not reachable:
+            reachable = {source_node_id}
+        cluster = self._get_cluster_nodes(source_node_id)
+        ranked: List[Tuple[int, float, StorageVirtualNode]] = []
+        for node_id in reachable:
+            node = self.nodes.get(node_id)
+            if not node or node_id in self.failed_nodes:
+                continue
+            if exclude and node_id in exclude:
+                continue
+            if not self._node_has_capacity(node, file_size):
+                continue
+            if node_id == source_node_id:
+                cluster_priority = 2
+            elif node_id in cluster:
+                cluster_priority = 0
+            else:
+                cluster_priority = 1
+            ranked.append((cluster_priority, self._projected_usage_ratio(node), node))
+
+        if ranked:
+            ranked.sort(key=lambda entry: (entry[0], entry[1]))
+            return ranked[0][2].node_id
+
+        return self._ensure_target_capacity(source_node_id, file_size)
+
+    def store_local_file(self, node_id: str, file_name: str, file_size: int) -> Optional[FileTransfer]:
+        node = self.nodes.get(node_id)
+        if not node or node_id in self.failed_nodes:
+            return None
+        transfer = node.store_local_file(file_name, file_size, current_time=self.simulator.now)
+        if not transfer:
+            return None
+        self._register_file_aliases(transfer)
+        self._finalize_transfer(node_id, node_id, transfer.file_id, transfer)
+        return transfer
+
+    def get_file_manifest(self, file_name: str) -> Optional[FileManifest]:
+        return self.file_manifests.get(file_name)
+
+    def assemble_file(self, file_name: str, target_node_id: str) -> Optional[FileTransfer]:
+        manifest = self.file_manifests.get(file_name)
+        if not manifest or target_node_id not in self.nodes:
+            return None
+        last_transfer: Optional[FileTransfer] = None
+        for segment in manifest.segments:
+            if segment.node_id == target_node_id:
+                continue
+            replica_transfer = self.initiate_replica_transfer(segment.node_id, target_node_id, segment.file_id)
+            if not replica_transfer:
+                return None
+            last_transfer = replica_transfer
+            segment.node_id = target_node_id
+            segment.file_id = replica_transfer.file_id
+        if last_transfer:
+            return last_transfer
+        transfer = FileTransfer(
+            file_id=manifest.master_id,
+            file_name=manifest.file_name,
+            total_size=manifest.total_size,
+            chunks=[],
+            status=TransferStatus.COMPLETED,
+            created_at=self.simulator.now,
+            completed_at=self.simulator.now,
+            is_retrieval=True,
+            backing_file_id=manifest.master_id,
+            target_node=target_node_id,
+        )
+        self._register_file_aliases(transfer)
+        return transfer
+
+    def ingest_file(
+        self,
+        source_node_id: str,
+        file_name: str,
+        file_size: int,
+        *,
+        prefer_local: bool = False,
+    ) -> Optional[Tuple[str, FileTransfer]]:
+        if source_node_id not in self.nodes or source_node_id in self.failed_nodes:
+            return None
+        if prefer_local:
+            transfer = self.store_local_file(source_node_id, file_name, file_size)
+            if not transfer:
+                return None
+            manifest = FileManifest(
+                file_name=file_name,
+                master_id=transfer.backing_file_id or transfer.file_id,
+                total_size=file_size,
+                segments=[
+                    FileSegment(
+                        node_id=source_node_id,
+                        file_id=transfer.file_id,
+                        size=file_size,
+                        offset=0,
+                    )
+                ],
+                created_at=self.simulator.now,
+            )
+            self._register_manifest(manifest)
+            return source_node_id, transfer
+
+        manifest, last_transfer = self._distribute_file_segments(source_node_id, file_name, file_size)
+        if not manifest or not last_transfer:
+            return None
+        self._register_manifest(manifest)
+        last_segment = manifest.segments[-1]
+        return last_segment.node_id, last_transfer
 
     def _collect_node_telemetry(self, node: StorageVirtualNode) -> NodeTelemetry:
         projected = node.projected_storage_usage if hasattr(node, "projected_storage_usage") else node.used_storage
@@ -641,6 +872,83 @@ class StorageVirtualNetwork:
         )
         self.node_telemetry[node.node_id] = telemetry
         return telemetry
+
+    def _register_manifest(self, manifest: FileManifest) -> None:
+        existing = self.file_manifests.get(manifest.file_name)
+        if existing:
+            if self.file_manifests_by_id.get(existing.master_id) is existing:
+                self.file_manifests_by_id.pop(existing.master_id, None)
+            if self.file_names.get(existing.master_id) == existing.file_name:
+                self.file_names.pop(existing.master_id, None)
+            for segment in existing.segments:
+                if self.segment_manifests.get(segment.file_id) is existing:
+                    self.segment_manifests.pop(segment.file_id, None)
+                if self.file_names.get(segment.file_id) == existing.file_name:
+                    self.file_names.pop(segment.file_id, None)
+        self.file_manifests[manifest.file_name] = manifest
+        self.file_manifests_by_id[manifest.master_id] = manifest
+        self.file_names[manifest.master_id] = manifest.file_name
+        for segment in manifest.segments:
+            self.segment_manifests[segment.file_id] = manifest
+            self.file_names[segment.file_id] = manifest.file_name
+
+    def _distribute_file_segments(
+        self,
+        source_node_id: str,
+        file_name: str,
+        file_size: int,
+    ) -> Tuple[Optional[FileManifest], Optional[FileTransfer]]:
+        master_id = hashlib.md5(f"{file_name}-{self.simulator.now}-{source_node_id}".encode()).hexdigest()
+        bytes_remaining = file_size
+        offset = 0
+        segments: List[FileSegment] = []
+        exhausted: Set[str] = set()
+        last_transfer: Optional[FileTransfer] = None
+
+        while bytes_remaining > 0:
+            target_id = self._select_ingest_target(source_node_id, max(bytes_remaining, 1), exclude=exhausted)
+            if not target_id:
+                break
+            available = self._node_free_bytes(target_id)
+            if available <= 0:
+                exhausted.add(target_id)
+                continue
+            segment_size = min(bytes_remaining, available)
+            transfer = self.initiate_file_transfer(
+                source_node_id,
+                target_id,
+                file_name,
+                segment_size,
+                backing_file_id=master_id,
+                segment_offset=offset,
+            )
+            if not transfer:
+                exhausted.add(target_id)
+                continue
+            actual_target = transfer.target_node or target_id
+            segments.append(
+                FileSegment(
+                    node_id=actual_target,
+                    file_id=transfer.file_id,
+                    size=segment_size,
+                    offset=offset,
+                )
+            )
+            last_transfer = transfer
+            bytes_remaining -= segment_size
+            offset += segment_size
+
+        if bytes_remaining > 0 or not segments or not last_transfer:
+            return None, None
+
+        manifest = FileManifest(
+            file_name=file_name,
+            master_id=master_id,
+            total_size=file_size,
+            segments=segments,
+            created_at=self.simulator.now,
+        )
+        return manifest, last_transfer
 
     def _cause_ratio(self, telemetry: NodeTelemetry, cause: str) -> float:
         if cause == "storage":
@@ -1252,6 +1560,7 @@ class StorageVirtualNetwork:
         file_id: str,
         transfer: FileTransfer,
     ) -> None:
+        self._register_file_aliases(transfer)
         self._emit_event(
             "transfer_completed",
             file_id=file_id,

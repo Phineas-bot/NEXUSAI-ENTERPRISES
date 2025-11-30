@@ -36,6 +36,8 @@ class FileTransfer:
     completed_at: Optional[float] = None
     is_retrieval: bool = False
     backing_file_id: Optional[str] = None
+    target_node: Optional[str] = None
+    segment_offset: int = 0
 
     def __post_init__(self) -> None:
         if self.backing_file_id is None:
@@ -214,6 +216,8 @@ class StorageVirtualNode:
         source_node: Optional[str] = None,
         *,
         preferred_chunk_size: Optional[int] = None,
+        backing_file_id: Optional[str] = None,
+        segment_offset: int = 0,
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
         # Reserve disk capacity ahead of time so transfers cannot overcommit storage
@@ -228,11 +232,18 @@ class StorageVirtualNode:
             file_name=file_name,
             total_size=file_size,
             chunks=chunks,
-            created_at=current_time
+            created_at=current_time,
+            target_node=self.node_id,
+            backing_file_id=backing_file_id,
+            segment_offset=segment_offset,
         )
         
         self.active_transfers[file_id] = transfer
         return transfer
+
+    @property
+    def free_storage(self) -> int:
+        return self.disk.free_bytes
 
     def process_chunk_transfer(
         self,
@@ -356,7 +367,43 @@ class StorageVirtualNode:
             is_retrieval=True,
             backing_file_id=file_id,
             created_at=timestamp,
+            target_node=destination_node,
         )
+
+    def store_local_file(
+        self,
+        file_name: str,
+        file_size: int,
+        *,
+        current_time: float,
+    ) -> Optional[FileTransfer]:
+        """Persist a file directly onto this node without network hops."""
+
+        file_id = hashlib.md5(f"local-{self.node_id}-{file_name}-{current_time}".encode()).hexdigest()
+        if not self.disk.reserve_file(file_id, file_size, path=f"/{self.node_id}/{file_name}"):
+            return None
+
+        chunks = self._generate_chunks(file_id, file_size)
+        transfer = FileTransfer(
+            file_id=file_id,
+            file_name=file_name,
+            total_size=file_size,
+            chunks=chunks,
+            status=TransferStatus.COMPLETED,
+            created_at=current_time,
+            completed_at=current_time,
+            target_node=self.node_id,
+        )
+
+        for chunk in chunks:
+            chunk.status = TransferStatus.COMPLETED
+            chunk.stored_node = self.node_id
+            self.disk.write_chunk(file_id, chunk.chunk_id, data=None, expected_size=chunk.size)
+
+        self.stored_files[file_id] = transfer
+        self.total_data_transferred += file_size
+        self.total_requests_processed += 1
+        return transfer
 
     @property
     def used_storage(self) -> int:

@@ -3,9 +3,10 @@ from __future__ import annotations
 import cmd
 import shlex
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from controller import CloudSimController, parse_size
+from storage_virtual_node import TransferStatus
 
 
 class CloudSimShell(cmd.Cmd):
@@ -30,10 +31,10 @@ class CloudSimShell(cmd.Cmd):
 
     # Node commands ------------------------------------------------------
     def do_add(self, arg: str) -> None:
-        """add NODE_ID [--storage 500] [--bandwidth 1000] [--cpu 8] [--memory 32] [--zone auto]
+        """add NODE_ID [--storage 40] [--bandwidth 1000] [--cpu 8] [--memory 32] [--zone auto]
 
-        Create a new node with the provided capacities. If --zone is omitted a random zone
-        is selected automatically.
+        Nodes default to a random 30-50MB capacity; pass --storage (MB) only when you
+        explicitly need a larger lab box. Zones still randomize unless overridden.
         """
 
         tokens = self._parse(arg)
@@ -41,19 +42,19 @@ class CloudSimShell(cmd.Cmd):
             return
         node_id = tokens[0]
         opts = {
-            "storage_gb": 500,
             "bandwidth_mbps": 1000,
             "cpu_capacity": 8,
             "memory_capacity": 32,
             "zone": None,
         }
+        storage_override_mb: Optional[int] = None
         key = None
         for token in tokens[1:]:
             if token.startswith("--"):
                 key = token[2:]
                 continue
             if key == "storage":
-                opts["storage_gb"] = int(token)
+                storage_override_mb = int(token)
             elif key == "bandwidth":
                 opts["bandwidth_mbps"] = int(token)
             elif key == "cpu":
@@ -62,6 +63,8 @@ class CloudSimShell(cmd.Cmd):
                 opts["memory_capacity"] = int(token)
             elif key == "zone":
                 opts["zone"] = token
+        if storage_override_mb is not None:
+            opts["storage_gb"] = max(storage_override_mb, 1) / 1024.0
         try:
             node = self.controller.add_node(node_id, **opts)
             zone_label = node.zone or "unassigned"
@@ -256,6 +259,60 @@ class CloudSimShell(cmd.Cmd):
         except RuntimeError as exc:
             self._print(str(exc))
 
+    def do_push(self, arg: str) -> None:
+        """push SOURCE FILE SIZE [--local] -- store a file without naming the destination"""
+
+        tokens = self._parse(arg)
+        if not tokens:
+            self._print("Usage: push SOURCE FILE SIZE [--local]")
+            return
+        prefer_local = False
+        args: List[str] = []
+        for token in tokens:
+            if token == "--local":
+                prefer_local = True
+            else:
+                args.append(token)
+        if len(args) < 3:
+            self._print("Usage: push SOURCE FILE SIZE [--local]")
+            return
+        source, filename, size = args[:3]
+        size_bytes = parse_size(size)
+        try:
+            target_id, transfer = self.controller.push_file(source, filename, size_bytes, prefer_local=prefer_local)
+            if transfer.status != TransferStatus.COMPLETED:
+                self.controller.run_until_idle()
+            status_label = transfer.status.name
+            completed = transfer.completed_at
+            location = transfer.target_node or target_id
+            qualifier = "locally" if target_id == source else f"on {target_id}"
+            self._print(
+                f"Pushed {filename} from {source} stored {qualifier}; status {status_label},"
+                f" completed_at={completed}, stored_at={location}"
+            )
+        except (RuntimeError, ValueError) as exc:
+            self._print(str(exc))
+
+    def do_fetch(self, arg: str) -> None:
+        """fetch TARGET FILE -- download an existing dataset into TARGET"""
+
+        tokens = self._parse(arg)
+        if len(tokens) < 2:
+            self._print("Usage: fetch TARGET FILE")
+            return
+        target, file_name = tokens[0], tokens[1]
+        try:
+            transfer = self.controller.pull_file(target, file_name)
+            needs_simulation = transfer.is_retrieval and transfer.status != TransferStatus.COMPLETED
+            if needs_simulation:
+                self.controller.run_until_idle()
+            status_label = transfer.status.name
+            completed = transfer.completed_at
+            origin = "local cache" if not transfer.is_retrieval else "replica pull"
+            self._print(f"Fetched {file_name} into {target} via {origin}; status {status_label}, completed_at={completed}")
+        except (RuntimeError, ValueError) as exc:
+            self._print(str(exc))
+
     # Failures -----------------------------------------------------------
     def do_fail(self, arg: str) -> None:
         """fail NODE_ID -- mark a node offline"""
@@ -300,7 +357,17 @@ class CloudSimShell(cmd.Cmd):
         for event in events:
             event_type = event.get("type", "unknown")
             timestamp = event.get("time", 0.0)
-            details = {k: v for k, v in event.items() if k not in {"type", "time"}}
+            details = {}
+            preferred_name = event.get("file_name")
+            for key, value in event.items():
+                if key in {"type", "time", "file_name"}:
+                    continue
+                if key == "file_id" and preferred_name:
+                    details["file_name"] = preferred_name
+                    continue
+                details[key] = value
+            if preferred_name and "file_name" not in details:
+                details["file_name"] = preferred_name
             self._print(f"[{timestamp:0.2f}s] {event_type} {details}")
 
     # Persistence -------------------------------------------------------

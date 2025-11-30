@@ -3,7 +3,7 @@
 ## TL;DR
 
 - Launch with `python CloudSim/main.py` (interactive is the default mode).
-- Use `add node`, `connect`, and `transfer` to model clusters and data motion (multi-hop `connect` accepts more than two nodes).
+- Use `add node`, `connect`, `transfer`, `push`, and `fetch` to model clusters, data motion, uploads, and on-demand pulls (multi-hop `connect` accepts more than two nodes).
 - `inspect`, `nodes --all`, `fail`, `restore`, and `events` let you observe health and resiliency behaviors.
 - `save`, `load`, and `reset --clear` manage persistent snapshots so labs survive terminal restarts.
 - Type `help` or `help <command>` at any time for inline documentation.
@@ -92,6 +92,8 @@ Paste each block at the `cloudsim>` prompt to experience the main workflows. Sam
 | `connect <nodeA> <nodeB> [nodeC ...] [--bandwidth <Mbps>] [--latency <ms>]` | Link adjacent pairs; omit flags to let CloudSim infer metrics. | `connect core-1 edge-2 archive-1 --latency 5` |
 | `disconnect <nodeA> <nodeB>` | Break a link to force reroutes. | `disconnect core-1 edge-2` |
 | `transfer <src> <dst> <filename> <size>` | Simulate workload movement (size accepts `MB/GB/TB`). | `transfer ingest archive media-sync.bin 900GB` |
+| `push <src> <filename> <size> [--local]` | Upload a file without naming the destination (CloudSim auto-selects a node; `--local` keeps it on the uploader). | `push ingest dataset-alpha.bin 1TB` |
+| `fetch <target> <filename>` | Pull an existing dataset into a node without knowing where it currently lives (matches by name/id). | `fetch edge-cache dataset-alpha.bin` |
 | `fail <name>` | Take a node offline to showcase resiliency. | `fail edge-2` |
 | `restore <name>` | Return a failed node to service. | `restore edge-2` |
 | `nodes [--all]` | List nodes with health, capacity, utilization (use `--all` to include replicas). | `nodes --all` |
