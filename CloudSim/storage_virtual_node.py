@@ -70,13 +70,18 @@ class StorageVirtualNode:
     _WORKING_SET_FRACTION = 0.05  # Percent of total memory to reserve per active chunk (capped by chunk size)
     _MIN_WORKING_SET_BYTES = 4 * 1024 * 1024
 
+    _MIN_CHUNK_SIZE_BYTES = 256 * 1024
+    _MAX_CHUNK_SIZE_BYTES = 32 * 1024 * 1024
+
     def __init__(
         self,
         node_id: str,
         cpu_capacity: int,  # in vCPUs
         memory_capacity: int,  # in GB
         storage_capacity: int,  # in GB
-        bandwidth: int  # in Mbps
+        bandwidth: int,  # in Mbps
+        *,
+        zone: Optional[str] = None,
     ):
         self.node_id = node_id
         self.cpu_capacity = cpu_capacity
@@ -84,6 +89,7 @@ class StorageVirtualNode:
         self.total_storage = int(storage_capacity * 1024 * 1024 * 1024)  # Convert GB to bytes
         self.memory_capacity_bytes = max(1, int(memory_capacity * 1024 * 1024 * 1024))
         self.bandwidth = int(bandwidth * 1_000_000)  # Convert Mbps to bits per second
+        self.zone = zone
         self.ip_address: Optional[str] = None
         self.network_interfaces: Dict[str, NetworkInterface] = {}
         self.link_latencies: Dict[str, float] = {}
@@ -153,6 +159,7 @@ class StorageVirtualNode:
         node_id: str,
         storage_factor: float = 1.0,
         bandwidth_factor: float = 1.0,
+        zone: Optional[str] = None,
     ) -> "StorageVirtualNode":
         """Create a replica node with proportional resources."""
         storage_gb = max(1, math.ceil((self.total_storage / (1024 ** 3)) * storage_factor))
@@ -163,22 +170,26 @@ class StorageVirtualNode:
             memory_capacity=self.memory_capacity,
             storage_capacity=storage_gb,
             bandwidth=bandwidth_mbps,
+            zone=zone or self.zone,
         )
         return replica
 
-    def _calculate_chunk_size(self, file_size: int) -> int:
+    def _calculate_chunk_size(self, file_size: int, chunk_size_hint: Optional[int] = None) -> int:
         """Determine optimal chunk size based on file size"""
+        if chunk_size_hint is not None:
+            # Clamp external hints to safe bounds and total file size
+            normalized = max(self._MIN_CHUNK_SIZE_BYTES, min(chunk_size_hint, self._MAX_CHUNK_SIZE_BYTES))
+            return max(1, min(normalized, file_size))
         # Simple heuristic: larger files get larger chunks
         if file_size < 10 * 1024 * 1024:  # < 10MB
             return 512 * 1024  # 512KB chunks
-        elif file_size < 100 * 1024 * 1024:  # < 100MB
+        if file_size < 100 * 1024 * 1024:  # < 100MB
             return 2 * 1024 * 1024  # 2MB chunks
-        else:
-            return 10 * 1024 * 1024  # 10MB chunks
+        return 10 * 1024 * 1024  # 10MB chunks
 
-    def _generate_chunks(self, file_id: str, file_size: int) -> List[FileChunk]:
+    def _generate_chunks(self, file_id: str, file_size: int, chunk_size_hint: Optional[int] = None) -> List[FileChunk]:
         """Break file into chunks for transfer"""
-        chunk_size = self._calculate_chunk_size(file_size)
+        chunk_size = self._calculate_chunk_size(file_size, chunk_size_hint)
         num_chunks = math.ceil(file_size / chunk_size)
         
         chunks = []
@@ -200,7 +211,9 @@ class StorageVirtualNode:
         file_name: str,
         file_size: int,
         current_time: float,
-        source_node: Optional[str] = None
+        source_node: Optional[str] = None,
+        *,
+        preferred_chunk_size: Optional[int] = None,
     ) -> Optional[FileTransfer]:
         """Initiate a file storage request to this node"""
         # Reserve disk capacity ahead of time so transfers cannot overcommit storage
@@ -209,7 +222,7 @@ class StorageVirtualNode:
             return None
         
         # Create file transfer record
-        chunks = self._generate_chunks(file_id, file_size)
+        chunks = self._generate_chunks(file_id, file_size, preferred_chunk_size)
         transfer = FileTransfer(
             file_id=file_id,
             file_name=file_name,

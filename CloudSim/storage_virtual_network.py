@@ -5,6 +5,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import hashlib
 from collections import defaultdict
 import heapq
+import math
 
 from storage_virtual_node import (
     StorageVirtualNode,
@@ -206,16 +207,16 @@ class StorageVirtualNetwork:
         target_node = self.nodes[effective_target_id]
         self._maybe_expand_cluster(effective_target_id)
             
-        # Generate unique file ID
         file_id = hashlib.md5(f"{file_name}-{self.simulator.now}".encode()).hexdigest()
-        
-        # Request storage on target node
+        chunk_size = self._recommend_chunk_size(file_size, route)
+
         transfer = target_node.initiate_file_transfer(
             file_id,
             file_name,
             file_size,
             current_time=self.simulator.now,
             source_node=source_node_id,
+            preferred_chunk_size=chunk_size,
         )
 
         if not transfer and self.scaling.enabled:
@@ -223,12 +224,17 @@ class StorageVirtualNetwork:
             next_target_id = self._select_storage_node(retry_target_id, file_size)
             if next_target_id and next_target_id in self.nodes:
                 target_node = self.nodes[next_target_id]
+                route = self._compute_route(source_node_id, next_target_id)
+                if not route or route[-1] != next_target_id:
+                    return None
+                chunk_size = self._recommend_chunk_size(file_size, route)
                 transfer = target_node.initiate_file_transfer(
                     file_id,
                     file_name,
                     file_size,
                     current_time=self.simulator.now,
                     source_node=source_node_id,
+                    preferred_chunk_size=chunk_size,
                 )
                 effective_target_id = next_target_id
 
@@ -396,6 +402,31 @@ class StorageVirtualNetwork:
         if target_node_id not in parents:
             return None
         return self._build_path(parents, source_node_id, target_node_id)
+
+    def _recommend_chunk_size(self, file_size: int, route: Optional[List[str]]) -> int:
+        if file_size <= 0:
+            return StorageVirtualNode._MIN_CHUNK_SIZE_BYTES
+        if not route or len(route) < 2:
+            upper = min(StorageVirtualNode._MAX_CHUNK_SIZE_BYTES, file_size)
+            return max(StorageVirtualNode._MIN_CHUNK_SIZE_BYTES, upper)
+
+        hop_count = max(1, len(route) - 1)
+        capacities: List[float] = []
+        for idx in range(len(route) - 1):
+            capacity = self._link_capacity(route[idx], route[idx + 1])
+            if capacity > 0:
+                capacities.append(capacity)
+        if capacities:
+            bottleneck_bps = min(capacities)
+        else:
+            bottleneck_bps = 500_000_000  # ~500 Mbps fallback
+
+        bytes_per_second = max(64 * 1024, bottleneck_bps / 8)
+        target_duration = 0.35 + 0.15 * math.log2(hop_count + 1)
+        chunk_size = int(bytes_per_second * target_duration)
+        chunk_size = max(StorageVirtualNode._MIN_CHUNK_SIZE_BYTES, chunk_size)
+        chunk_size = min(chunk_size, StorageVirtualNode._MAX_CHUNK_SIZE_BYTES)
+        return max(1, min(chunk_size, file_size))
 
     def _compute_route_distance_vector(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
         active_nodes = [node_id for node_id in self.nodes if not self._should_skip_node(node_id)]

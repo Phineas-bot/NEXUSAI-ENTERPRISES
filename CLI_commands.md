@@ -15,20 +15,21 @@
 2. Install dependencies once: `pip install -r requirements.txt`.
 3. Run all commands from the repo root (`C:\Users\...\NEXUSAI-ENTERPRISES`).
 
-## Starting the Shell
-
-```powershell
-python CloudSim/main.py
-```
-
-Add `--mode interactive` only if you are scripting the launch and want to be explicit. The prompt changes to `cloudsim>` when the REPL is ready.
-
 ## Essential Concepts
 
 - **Nodes** represent storage endpoints with capacity, zone, and health state.
 - **Links** define bandwidth/latency between nodes and influence transfer throughput.
 - **Transfers** break multi-terabyte jobs into chunks so you can watch scheduling decisions.
 - **Events/telemetry** capture what just happened—great for demos and debugging.
+
+## Automatic Allocations
+
+- **Zones:** Every node you add is dropped into a randomly selected cloud-like zone (override with `--zone`). The zone drives latency and bandwidth heuristics.
+- **Links:** When you connect nodes without specifying `--bandwidth`/`--latency`, CloudSim infers realistic values based on whether the nodes share a zone, a region, or a continent.
+- **Chunks:** Transfers auto-size their chunks by analyzing file size, hop count, and route bottlenecks, so cross-region copies automatically use smaller, more responsive chunks.
+- **Auto wiring sanity checks:** Use `nodes` or `links` after an `add`/`connect` to see which zones and link metrics were assigned automatically.
+
+You can still override any of these by passing explicit flags, but the defaults keep the REPL snappy for exploratory work.
 
 ## Five-Minute Interactive Tour
 
@@ -76,11 +77,11 @@ Paste each block at the `cloudsim>` prompt to experience the main workflows. Sam
 
 | Command | Why you use it | Example |
 | --- | --- | --- |
-| `add node <name> [--capacity <bytes>] [--zone <zone>]` | Introduce capacity in a zone; accepts `GB/TB/PB` shorthands. | `add node core-1 --capacity 8TB --zone eu-central-1a` |
+| `add node <name> [--capacity <bytes>] [--zone <zone>]` | Introduce capacity in a specific or auto-assigned zone; accepts `GB/TB/PB` shorthands. | `add node core-1 --capacity 8TB --zone eu-central-1a` |
 | `remove node <name>` | Cleanly decommission a node. | `remove node old-cache` |
-| `connect <nodeA> <nodeB> [--bandwidth <bps>] [--latency <ms>]` | Control link characteristics for routing demos. | `connect core-1 edge-2 --bandwidth 2Gbps --latency 10ms` |
+| `connect <nodeA> <nodeB> [--bandwidth <bps>] [--latency <ms>]` | Link nodes; omit flags to let CloudSim pick realistic bandwidth/latency from their zones. | `connect core-1 edge-2 --latency 5` |
 | `disconnect <nodeA> <nodeB>` | Break a link to force reroutes. | `disconnect core-1 edge-2` |
-| `transfer <label> --src <node> --dst <node> --size <bytes> [--chunks <n>]` | Simulate workload movement and observe chunk scheduling. | `transfer media-sync --src ingest --dst archive --size 900GB --chunks 9` |
+| `transfer <label> --src <node> --dst <node> --size <bytes> [--chunks <n>]` | Simulate workload movement; omit `--chunks` to rely on automatic chunk sizing. | `transfer media-sync --src ingest --dst archive --size 900GB` |
 | `fail node <name> [--reason <text>]` | Take a node offline to showcase resiliency. | `fail node edge-2 --reason link-flap` |
 | `restore node <name>` | Return a failed node to service. | `restore node edge-2` |
 | `nodes` | List nodes with health, capacity, utilization. | `nodes` |

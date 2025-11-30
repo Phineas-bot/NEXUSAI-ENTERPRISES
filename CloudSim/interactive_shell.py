@@ -28,9 +28,10 @@ class CloudSimShell(cmd.Cmd):
 
     # Node commands ------------------------------------------------------
     def do_add(self, arg: str) -> None:
-        """add NODE_ID [--storage 500] [--bandwidth 1000] [--cpu 8] [--memory 32]
+        """add NODE_ID [--storage 500] [--bandwidth 1000] [--cpu 8] [--memory 32] [--zone auto]
 
-        Create a new node with the provided capacities.
+        Create a new node with the provided capacities. If --zone is omitted a random zone
+        is selected automatically.
         """
 
         tokens = self._parse(arg)
@@ -42,6 +43,7 @@ class CloudSimShell(cmd.Cmd):
             "bandwidth_mbps": 1000,
             "cpu_capacity": 8,
             "memory_capacity": 32,
+            "zone": None,
         }
         key = None
         for token in tokens[1:]:
@@ -56,9 +58,12 @@ class CloudSimShell(cmd.Cmd):
                 opts["cpu_capacity"] = int(token)
             elif key == "memory":
                 opts["memory_capacity"] = int(token)
+            elif key == "zone":
+                opts["zone"] = token
         try:
-            self.controller.add_node(node_id, **opts)
-            self._print(f"Node '{node_id}' added")
+            node = self.controller.add_node(node_id, **opts)
+            zone_label = node.zone or "unassigned"
+            self._print(f"Node '{node_id}' added in zone {zone_label}")
         except ValueError as exc:
             self._print(str(exc))
 
@@ -84,7 +89,8 @@ class CloudSimShell(cmd.Cmd):
         for row in rows:
             status = "online" if row.online else "offline"
             self._print(
-                f"{row.node_id:12} {status:8} storage {row.storage_used}/{row.storage_total} bytes,"
+                f"{row.node_id:12} {status:8} zone {row.zone or 'n/a':12} "
+                f"storage {row.storage_used}/{row.storage_total} bytes,"
                 f" bandwidth {row.bandwidth_bps} bps"
             )
 
@@ -107,8 +113,8 @@ class CloudSimShell(cmd.Cmd):
             self._print("Usage: connect NODE_A NODE_B [--bandwidth Mbps] [--latency ms]")
             return
         node_a, node_b = tokens[:2]
-        bandwidth = 1000
-        latency = 1.0
+        bandwidth = None
+        latency = None
         key = None
         for token in tokens[2:]:
             if token.startswith("--"):
@@ -119,7 +125,16 @@ class CloudSimShell(cmd.Cmd):
             elif key == "latency":
                 latency = float(token)
         if self.controller.connect_nodes(node_a, node_b, bandwidth, latency):
-            self._print(f"Connected {node_a} <-> {node_b}")
+            link = self.controller.network.nodes.get(node_a)
+            bw_label = None
+            latency_label = None
+            if link and node_b in link.connections:
+                bw_label = max(1, int(link.connections[node_b] / 1_000_000))
+                latency_label = link.link_latencies.get(node_b, 0.0)
+            extra = ""
+            if bw_label is not None and latency_label is not None:
+                extra = f" ({bw_label} Mbps, {latency_label} ms)"
+            self._print(f"Connected {node_a} <-> {node_b}{extra}")
         else:
             self._print("Connection failed; ensure both nodes exist")
 

@@ -19,6 +19,21 @@ def test_add_and_list_nodes():
     assert ids == {"node-a", "node-b"}
 
 
+def test_add_node_assigns_zone_when_missing():
+    controller = CloudSimController()
+    node = controller.add_node("node-auto")
+    assert node.zone is not None
+    info = controller.get_node_info("node-auto")
+    assert info["zone"] == node.zone
+
+
+def test_add_node_respects_zone_override():
+    controller = CloudSimController()
+    controller.add_node("node-eu", zone="eu-central-1a")
+    info = controller.get_node_info("node-eu")
+    assert info["zone"] == "eu-central-1a"
+
+
 def test_parse_size_handles_suffixes():
     assert parse_size("1GB") == 1024 * 1024 * 1024
     assert parse_size("2mb") == 2 * 1024 * 1024

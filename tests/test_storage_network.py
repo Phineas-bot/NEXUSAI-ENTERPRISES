@@ -71,6 +71,22 @@ def _run_parallel_transfers(file_size: int = FILE_SIZE):
     return transfer_one, transfer_two
 
 
+def test_chunk_strategy_scales_with_bandwidth():
+    large_file = 200 * 1024 * 1024
+    _, fast_network = _build_network(bandwidth_mbps=2000)
+    fast_transfer = fast_network.initiate_file_transfer("node-a", "node-b", "fast.bin", large_file)
+    assert fast_transfer is not None
+    fast_chunks = len(fast_transfer.chunks)
+
+    _, slow_network = _build_network(bandwidth_mbps=200)
+    slow_transfer = slow_network.initiate_file_transfer("node-a", "node-b", "slow.bin", large_file)
+    assert slow_transfer is not None
+    slow_chunks = len(slow_transfer.chunks)
+
+    assert slow_chunks >= fast_chunks
+    assert slow_chunks > 1
+
+
 def test_concurrent_transfers_share_bandwidth():
     baseline = _run_single_transfer()
     assert baseline.status == TransferStatus.COMPLETED

@@ -1,13 +1,28 @@
 from __future__ import annotations
 
 import shlex
+import random
 from collections import deque
 from dataclasses import dataclass, asdict
-from typing import Deque, Dict, List, Optional
+from typing import Deque, Dict, List, Optional, Tuple
 
 from simulator import Simulator
 from storage_virtual_network import StorageVirtualNetwork
 from storage_virtual_node import StorageVirtualNode
+
+
+ZONE_CATALOG = (
+    "us-east-1a",
+    "us-east-1b",
+    "us-east-2a",
+    "us-west-1a",
+    "us-west-2b",
+    "eu-central-1a",
+    "eu-west-1b",
+    "ap-south-1a",
+    "ap-northeast-1c",
+    "sa-east-1a",
+)
 
 
 @dataclass
@@ -17,6 +32,7 @@ class NodeStatus:
     storage_used: int
     storage_total: int
     bandwidth_bps: int
+    zone: Optional[str]
     replicas: Optional[str] = None
 
 
@@ -28,6 +44,7 @@ class CloudSimController:
         self.network = StorageVirtualNetwork(self.simulator, tick_interval=tick_interval)
         self._events: Deque[Dict[str, object]] = deque(maxlen=event_history)
         self.network.register_observer(self._record_event)
+        self._rng = random.Random()
 
     # Event handling -----------------------------------------------------
     def _record_event(self, event: Dict[str, object]) -> None:
@@ -46,15 +63,18 @@ class CloudSimController:
         cpu_capacity: int = 8,
         memory_capacity: int = 32,
         root_id: Optional[str] = None,
+        zone: Optional[str] = None,
     ) -> StorageVirtualNode:
         if node_id in self.network.nodes:
             raise ValueError(f"Node '{node_id}' already exists")
+        zone = zone or self._random_zone()
         node = StorageVirtualNode(
             node_id,
             cpu_capacity=cpu_capacity,
             memory_capacity=memory_capacity,
             storage_capacity=storage_gb,
             bandwidth=bandwidth_mbps,
+            zone=zone,
         )
         self.network.add_node(node, root_id=root_id)
         return node
@@ -72,6 +92,7 @@ class CloudSimController:
                     storage_used=node.used_storage,
                     storage_total=node.total_storage,
                     bandwidth_bps=node.bandwidth,
+                    zone=node.zone,
                     replicas=self.network.get_replica_parent(node_id),
                 )
             )
@@ -81,7 +102,19 @@ class CloudSimController:
         return {root: sorted(nodes) for root, nodes in self.network.cluster_nodes.items()}
 
     # Topology -----------------------------------------------------------
-    def connect_nodes(self, node_a: str, node_b: str, bandwidth_mbps: int = 1000, latency_ms: float = 1.0) -> bool:
+    def connect_nodes(
+        self,
+        node_a: str,
+        node_b: str,
+        bandwidth_mbps: Optional[int] = None,
+        latency_ms: Optional[float] = None,
+    ) -> bool:
+        if bandwidth_mbps is None or latency_ms is None:
+            inferred_bw, inferred_latency = self._auto_link_profile(node_a, node_b)
+            if bandwidth_mbps is None:
+                bandwidth_mbps = inferred_bw
+            if latency_ms is None:
+                latency_ms = inferred_latency
         return self.network.connect_nodes(node_a, node_b, bandwidth_mbps, latency_ms)
 
     def disconnect_nodes(self, node_a: str, node_b: str) -> bool:
@@ -152,11 +185,49 @@ class CloudSimController:
             "used_storage": node.used_storage,
             "total_storage": node.total_storage,
             "bandwidth": node.bandwidth,
+            "zone": node.zone,
             "replica_parent": self.network.get_replica_parent(node_id),
         }
         if telemetry:
             info["telemetry"] = asdict(telemetry)
         return info
+
+    def _random_zone(self) -> str:
+        return self._rng.choice(ZONE_CATALOG)
+
+    @staticmethod
+    def _zone_region(zone: Optional[str]) -> Optional[str]:
+        if not zone:
+            return None
+        tokens = zone.split("-")
+        if len(tokens) < 3:
+            return zone
+        return "-".join(tokens[:3])
+
+    def _auto_link_profile(self, node_a: str, node_b: str) -> Tuple[int, float]:
+        node_obj_a = self.network.nodes.get(node_a)
+        node_obj_b = self.network.nodes.get(node_b)
+        if not node_obj_a or not node_obj_b:
+            return 1000, 1.0
+
+        zone_a = node_obj_a.zone
+        zone_b = node_obj_b.zone
+        same_zone = zone_a and zone_b and zone_a == zone_b
+        region_a = self._zone_region(zone_a)
+        region_b = self._zone_region(zone_b)
+        same_region = bool(region_a and region_b and region_a == region_b)
+
+        rng = self._rng
+        if same_zone:
+            bandwidth = rng.randint(1800, 2500)
+            latency = round(rng.uniform(0.2, 0.8), 2)
+        elif same_region:
+            bandwidth = rng.randint(900, 1600)
+            latency = round(rng.uniform(2.0, 7.0), 2)
+        else:
+            bandwidth = rng.randint(300, 900)
+            latency = round(rng.uniform(20.0, 80.0), 2)
+        return bandwidth, latency
 
 
 def parse_size(value: str) -> int:
