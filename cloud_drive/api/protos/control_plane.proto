@@ -1,0 +1,253 @@
+syntax = "proto3";
+
+package cloud_drive.api.v1;
+
+option csharp_namespace = "CloudDrive.Api.V1";
+option go_package = "github.com/nexusai/cloud_drive/api/v1;apiv1";
+option java_multiple_files = true;
+option java_package = "com.nexusai.clouddrive.api.v1";
+option objc_class_prefix = "CDAPI";
+option php_namespace = "NexusAI\\CloudDrive\\Api\\V1";
+
+import "google/protobuf/timestamp.proto";
+
+message RequestContext {
+  string org_id = 1;
+  string user_id = 2;
+  string session_id = 3;
+  repeated string scopes = 4;
+}
+
+message Pagination {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;
+  string order_by = 4;
+}
+
+message ErrorDetail {
+  string code = 1;
+  string message = 2;
+  map<string, string> metadata = 3;
+}
+
+message OperationMetadata {
+  string resource_id = 1;
+  string manifest_id = 2;
+  int64 total_chunks = 3;
+  int64 completed_chunks = 4;
+  google.protobuf.Timestamp started_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message Operation {
+  string operation_id = 1;
+  bool done = 2;
+  OperationMetadata metadata = 3;
+  ErrorDetail error = 4;
+  bytes response = 5;
+}
+
+message Org {
+  string id = 1;
+  string name = 2;
+  string plan = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+message User {
+  string id = 1;
+  string org_id = 2;
+  string email = 3;
+  string role = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+message FileResource {
+  string id = 1;
+  string org_id = 2;
+  string parent_id = 3;
+  string name = 4;
+  string mime_type = 5;
+  int64 size_bytes = 6;
+  string checksum = 7;
+  bool is_folder = 8;
+  string created_by = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+  repeated FileVersion versions = 12;
+}
+
+message FileVersion {
+  string id = 1;
+  string file_id = 2;
+  string manifest_id = 3;
+  int64 size_bytes = 4;
+  int32 version_number = 5;
+  string retention_tier = 6;
+  string created_by = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message Share {
+  string id = 1;
+  string file_id = 2;
+  string principal_type = 3;
+  string principal_id = 4;
+  string permission = 5;
+  google.protobuf.Timestamp expires_at = 6;
+  string created_by = 7;
+  google.protobuf.Timestamp created_at = 8;
+}
+
+message UploadSession {
+  string session_id = 1;
+  string file_id = 2;
+  string parent_id = 3;
+  int64 expected_size = 4;
+  int64 chunk_size = 5;
+  string checksum = 6;
+  string created_by = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  int64 received_bytes = 9;
+}
+
+message CreateFileRequest {
+  RequestContext context = 1;
+  string parent_id = 2;
+  string name = 3;
+  bool is_folder = 4;
+  string mime_type = 5;
+}
+
+message GetFileRequest {
+  RequestContext context = 1;
+  string file_id = 2;
+}
+
+message ListFilesRequest {
+  RequestContext context = 1;
+  string parent_id = 2;
+  Pagination page = 3;
+}
+
+message ListFilesResponse {
+  repeated FileResource files = 1;
+  string next_page_token = 2;
+}
+
+message CreateUploadSessionRequest {
+  RequestContext context = 1;
+  string file_id = 2;
+  string parent_id = 3;
+  int64 size_bytes = 4;
+  string checksum = 5;
+  int64 chunk_size = 6;
+}
+
+message CreateUploadSessionResponse {
+  UploadSession session = 1;
+  repeated string upload_urls = 2;
+}
+
+message AppendUploadChunkRequest {
+  RequestContext context = 1;
+  string session_id = 2;
+  int64 chunk_id = 3;
+  int64 offset = 4;
+  bytes data = 5;
+  string source_node = 6;
+  string file_name = 7;
+  int64 chunk_bytes = 8;
+}
+
+message AppendUploadChunkResponse {
+  int64 received_bytes = 1;
+}
+
+message FinalizeUploadRequest {
+  RequestContext context = 1;
+  string session_id = 2;
+  string checksum = 3;
+  map<string, string> metadata = 4;
+}
+
+message FinalizeUploadResponse {
+  Operation operation = 1;
+}
+
+message AbortUploadRequest {
+  RequestContext context = 1;
+  string session_id = 2;
+}
+
+message AbortUploadResponse {}
+
+message GetOperationRequest {
+  RequestContext context = 1;
+  string operation_id = 2;
+}
+
+message CancelOperationRequest {
+  RequestContext context = 1;
+  string operation_id = 2;
+}
+
+message CancelOperationResponse {}
+
+message ShareFileRequest {
+  RequestContext context = 1;
+  string file_id = 2;
+  repeated Share grants = 3;
+}
+
+message ShareFileResponse {
+  repeated Share grants = 1;
+}
+
+message ListSharesRequest {
+  RequestContext context = 1;
+  string file_id = 2;
+}
+
+message ListSharesResponse {
+  repeated Share grants = 1;
+}
+
+message DownloadChunkRequest {
+  RequestContext context = 1;
+  string file_id = 2;
+  string version_id = 3;
+  int64 offset = 4;
+  int64 length = 5;
+}
+
+message DownloadChunk {
+  bytes data = 1;
+  int64 offset = 2;
+  bool eof = 3;
+}
+
+service FilesService {
+  rpc CreateFile(CreateFileRequest) returns (FileResource);
+  rpc GetFile(GetFileRequest) returns (FileResource);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+}
+
+service UploadsService {
+  rpc CreateSession(CreateUploadSessionRequest) returns (CreateUploadSessionResponse);
+  rpc AppendChunk(AppendUploadChunkRequest) returns (AppendUploadChunkResponse);
+  rpc Finalize(FinalizeUploadRequest) returns (FinalizeUploadResponse);
+  rpc Abort(AbortUploadRequest) returns (AbortUploadResponse);
+  rpc DownloadChunks(DownloadChunkRequest) returns (stream DownloadChunk);
+}
+
+service OperationsService {
+  rpc Get(GetOperationRequest) returns (Operation);
+  rpc Cancel(CancelOperationRequest) returns (CancelOperationResponse);
+}
+
+service SharingService {
+  rpc ShareFile(ShareFileRequest) returns (ShareFileResponse);
+  rpc ListShares(ListSharesRequest) returns (ListSharesResponse);
+}

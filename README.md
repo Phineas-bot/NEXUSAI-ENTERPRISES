@@ -12,6 +12,7 @@ A lightweight simulator that models storage nodes, their network interconnects, 
 - **Routing Engine**: Assigns IPs automatically, builds per-node routing tables via a latency-aware link-state algorithm, and drives multi-hop chunk forwarding with per-hop bandwidth sharing.
 - **Demand Scaling**: A decentralized policy that lets any saturated node spawn replicas and extend the topology without a central coordinator.
 - **Replica Transfers**: `StorageVirtualNetwork.initiate_replica_transfer` reuses stored data, driving disk reads through each node's VirtualOS so replicas receive consistent chunks without pre-reading entire files.
+- **Control Plane gRPC API**: `cloud_drive/api/protos/control_plane.proto` defines Files, Uploads, Sharing, and Operations services plus shared messages (pagination, LRO metadata, ACL context). Use `python -m grpc_tools.protoc -I cloud_drive/api/protos --python_out=. --grpc_python_out=. cloud_drive/api/protos/control_plane.proto` to generate Python stubs for new handlers.
 
 ## Running the Test Suite
 
@@ -21,6 +22,41 @@ Use the existing virtual environment and execute the Pytest suite to validate th
 cd "C:/Users/USER PRO/nexusAI/NEXUSAI-ENTERPRISES"
 .venv\Scripts\python.exe -m pytest
 ```
+
+## gRPC Control Plane
+
+- Install the runtime/tooling dependencies inside the venv:
+	```powershell
+	.venv\Scripts\python.exe -m pip install grpcio grpcio-tools
+	```
+- (Re)generate Python bindings whenever `control_plane.proto` changes:
+	```powershell
+	.venv\Scripts\python.exe -m grpc_tools.protoc -I cloud_drive/api/protos --python_out=cloud_drive/api --grpc_python_out=cloud_drive/api cloud_drive/api/protos/control_plane.proto
+	```
+- Launch the gRPC server (insecure development port by default):
+	```powershell
+	.venv\Scripts\python.exe -m cloud_drive.api.grpc_server --bind localhost:50051
+	```
+	The server wires Files/Uploads/Sharing/Operations services directly into the running simulator; see `tests/test_cloud_drive_grpc.py` for an end-to-end example client.
+	Uploads now persist manifests into the storage fabric during `Finalize`, so the `UploadsService.DownloadChunks` streaming RPC can read those manifests back and emit chunked responses (the test covers both full and partial reads).
+- Provide TLS credentials to the standalone gRPC process with `--tls-cert path/to/cert.pem --tls-key path/to/key.pem`. The FastAPI gateway picks up the same capability via environment variables: set `CLOUD_DRIVE_GRPC_TLS_CERT` and `CLOUD_DRIVE_GRPC_TLS_KEY` before launching `uvicorn` to expose the embedded listener over TLS instead of plaintext.
+- When you run the FastAPI gateway (for example `uvicorn cloud_drive.api.server:app --reload`), the same module now boots the gRPC control-plane server in-process using the shared runtime. Override the bind address with `CLOUD_DRIVE_GRPC_BIND=127.0.0.1:55051` if the default `0.0.0.0:50051` conflicts with other services.
+- The FastAPI server now mirrors the gRPC finalize/download flow: `POST /uploads:finalize/{session}` returns an LRO-style payload containing the resolved file + manifest IDs, and `GET /files/{id}/download` streams file contents (with optional `offset`, `length`, and `chunk_size` query params) by delegating to the same manifest-driven pipeline.
+
+## Background Jobs & Scheduling
+
+- `CloudDriveRuntime.run_background_jobs()` is the single entry point that fans out to all policy-driven maintenance loops. A single invocation performs two units of work:
+	- `LifecycleManager.evaluate_transitions()` demotes cold data and emits `lifecycle.transitions` bus events, but it short-circuits unless the configured `rebalance_interval_seconds` window has elapsed. Runners should therefore schedule the background job no less frequently than that interval (default: 1 hour) to keep hot/cold annotations current.
+	- `HealingService.run_health_checks()` batches reconciliation, checksum scrubbing, degraded-node evacuation, and orphan cleanup. The method publishes a consolidated `healing.events` payload whenever any of those lists are non-empty so operators can hook alerting or telemetry.
+- Neither the FastAPI nor gRPC servers trigger these jobs automatically; production deployments must wire a scheduler. Common patterns include:
+	1. **Process-local loop** – when embedding the API inside a long-running process, start an asyncio/background task during `startup` that sleeps for `N` seconds (for example 60–300) between calls to `runtime.run_background_jobs()`. Keep `N` aligned with the lifecycle interval and desired healing cadence.
+	2. **External orchestrator** – in batch or multi-process setups, point cron/Task Scheduler/Kubernetes CronJobs at a short Python script that imports `CloudDriveRuntime`, calls `bootstrap()`, invokes `run_background_jobs()`, and exits. This keeps the maintenance plane decoupled from the API surface.
+	3. **Event-driven hook** – after simulating failures or injecting new manifests in tests/demos, explicitly call `runtime.run_background_jobs()` once so rebalance/healing effects are observable immediately.
+- As a rule of thumb, run the job:
+	- Shortly after upload bursts (to enforce replica/durability policy before the next client read).
+	- Within one rebalance interval after a node failure or capacity alert so evacuation kicks in.
+	- At least 4× per day even in idle clusters to ensure checksum scrubbing and orphan cleanup stay current when `DurabilityPolicyConfig.enable_scrubbing` is true.
+- Instrumentation teams can watch `healing.events` and `lifecycle.transitions` topics (via the configured message bus backend) to confirm the scheduler is firing; lack of events over multiple intervals usually indicates the job runner has stalled.
 
 The suite currently includes:
 
