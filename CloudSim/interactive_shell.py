@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cmd
 import shlex
+from pathlib import Path
 from typing import Any, List
 
 from controller import CloudSimController, parse_size
@@ -13,7 +14,8 @@ class CloudSimShell(cmd.Cmd):
 
     def __init__(self):
         super().__init__()
-        self.controller = CloudSimController()
+        state_path = Path(__file__).resolve().parent / "cloudsim_state.json"
+        self.controller = CloudSimController(enable_persistence=True, state_path=str(state_path))
 
     # Helpers ------------------------------------------------------------
     def _print(self, message: str) -> None:

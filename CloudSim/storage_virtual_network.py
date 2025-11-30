@@ -115,7 +115,13 @@ class StorageVirtualNetwork:
         self.failed_nodes: Set[str] = set()
         self._os_failure_baseline: Dict[str, int] = defaultdict(int)
         
-    def add_node(self, node: StorageVirtualNode, root_id: Optional[str] = None):
+    def add_node(
+        self,
+        node: StorageVirtualNode,
+        root_id: Optional[str] = None,
+        *,
+        suppress_replica_coverage: bool = False,
+    ):
         """Add a node to the network"""
         if not getattr(node, "ip_address", None):
             node.ip_address = self._allocate_ip()
@@ -125,7 +131,8 @@ class StorageVirtualNetwork:
         self._register_node_cluster(node.node_id, root_id)
         self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
         self.failed_nodes.discard(node.node_id)
-        self._ensure_replica_coverage(node.node_id)
+        if not suppress_replica_coverage:
+            self._ensure_replica_coverage(node.node_id)
         
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
         """Connect two nodes with specified bandwidth and latency"""

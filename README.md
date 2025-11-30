@@ -54,6 +54,12 @@ cloudsim> events 5
 The shell keeps the simulator alive so you can mark nodes offline (`fail node-b`), restore them, disconnect links, or inspect replica clusters in real time. Use `help` or `help <command>` from inside the shell to see the full catalog of actions.
 `connect` accepts more than two node IDs and links each adjacent pair, and `inspect NODE_ID` dumps bandwidth/storage telemetry, stored files, replica parents/children, and active transfers.
 
+### Persistent Sessions
+
+- The interactive shell now auto-loads and auto-saves `CloudSim/cloudsim_state.json`, so any nodes, links, stored files, and event history remain intact after you close and reopen the terminal.
+- State snapshots capture cluster topology, replica membership, node telemetry, and on-disk file metadata; successful transfers are available immediately after restarting.
+- Programmatic callers can opt into the same behavior by instantiating `CloudSimController(enable_persistence=True, state_path="/path/to/state.json")`.
+
 ## Bandwidth-Sharing Expectations
 
 - When a link has multiple active transfers, each transfer receives an equal share of the link bandwidth during every tick.

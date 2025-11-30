@@ -1,14 +1,17 @@
 from __future__ import annotations
 
+import os
 import shlex
 import random
+import sys
 from collections import deque
 from dataclasses import dataclass, asdict
-from typing import Deque, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 from simulator import Simulator
+from state_store import CloudSimStateStore
 from storage_virtual_network import DemandScalingConfig, StorageVirtualNetwork
-from storage_virtual_node import StorageVirtualNode
+from storage_virtual_node import FileChunk, FileTransfer, StorageVirtualNode, TransferStatus
 
 
 ZONE_CATALOG = (
@@ -39,7 +42,14 @@ class NodeStatus:
 class CloudSimController:
     """Stateful helper exposing imperative control over StorageVirtualNetwork."""
 
-    def __init__(self, tick_interval: float = 0.005, event_history: int = 200):
+    def __init__(
+        self,
+        tick_interval: float = 0.005,
+        event_history: int = 200,
+        *,
+        enable_persistence: bool = False,
+        state_path: Optional[str] = None,
+    ):
         self.simulator = Simulator()
         scaling = DemandScalingConfig(
             enabled=True,
@@ -58,6 +68,17 @@ class CloudSimController:
         self._events: Deque[Dict[str, object]] = deque(maxlen=event_history)
         self.network.register_observer(self._record_event)
         self._rng = random.Random()
+        self._restoring_state = False
+        self._persistence_enabled = enable_persistence
+        self._state_store: Optional[CloudSimStateStore] = None
+        if self._persistence_enabled:
+            default_path = state_path or os.path.join(os.path.dirname(__file__), "cloudsim_state.json")
+            self._state_store = CloudSimStateStore(default_path)
+            snapshot = self._state_store.load()
+            if snapshot:
+                self._restore_state(snapshot)
+            else:
+                self._persist_state()
 
     # Event handling -----------------------------------------------------
     def _record_event(self, event: Dict[str, object]) -> None:
@@ -90,10 +111,14 @@ class CloudSimController:
             zone=zone,
         )
         self.network.add_node(node, root_id=root_id)
+        self._persist_state()
         return node
 
     def remove_node(self, node_id: str) -> bool:
-        return self.network.remove_node(node_id)
+        removed = self.network.remove_node(node_id)
+        if removed:
+            self._persist_state()
+        return removed
 
     def list_node_status(self, include_replicas: bool = False) -> List[NodeStatus]:
         rows: List[NodeStatus] = []
@@ -131,7 +156,10 @@ class CloudSimController:
                 bandwidth_mbps = inferred_bw
             if latency_ms is None:
                 latency_ms = inferred_latency
-        return self.network.connect_nodes(node_a, node_b, bandwidth_mbps, latency_ms)
+        success = self.network.connect_nodes(node_a, node_b, bandwidth_mbps, latency_ms)
+        if success:
+            self._persist_state()
+        return success
 
     def disconnect_nodes(self, node_a: str, node_b: str) -> bool:
         if node_a not in self.network.nodes or node_b not in self.network.nodes:
@@ -142,6 +170,7 @@ class CloudSimController:
         reverse = (node_b, node_a)
         self.network.failed_links.discard(key)
         self.network.failed_links.discard(reverse)
+        self._persist_state()
         return True
 
     # Transfers ----------------------------------------------------------
@@ -153,22 +182,32 @@ class CloudSimController:
 
     def run_until_idle(self) -> None:
         self.simulator.run()
+        self._persist_state()
 
     def run_for(self, duration: float) -> None:
         self.simulator.run(until=self.simulator.now + duration)
+        self._persist_state()
 
     # Failure injection --------------------------------------------------
     def fail_node(self, node_id: str) -> bool:
-        return self.network.fail_node(node_id)
+        result = self.network.fail_node(node_id)
+        if result:
+            self._persist_state()
+        return result
 
     def restore_node(self, node_id: str) -> None:
         self.network.restore_node(node_id)
+        self._persist_state()
 
     def fail_link(self, node_a: str, node_b: str) -> bool:
-        return self.network.fail_link(node_a, node_b)
+        result = self.network.fail_link(node_a, node_b)
+        if result:
+            self._persist_state()
+        return result
 
     def restore_link(self, node_a: str, node_b: str) -> None:
         self.network.restore_link(node_a, node_b)
+        self._persist_state()
 
     # Inspection ---------------------------------------------------------
     def get_transfer_summary(self) -> List[Dict[str, object]]:
@@ -263,6 +302,221 @@ class CloudSimController:
             bandwidth = rng.randint(300, 900)
             latency = round(rng.uniform(20.0, 80.0), 2)
         return bandwidth, latency
+
+    # Persistence -------------------------------------------------------
+    def _persist_state(self) -> None:
+        if not self._persistence_enabled or self._restoring_state or not self._state_store:
+            return
+        try:
+            self._state_store.save(self._snapshot_state())
+        except OSError as exc:
+            print(f"[cloudsim] Failed to persist state: {exc}", file=sys.stderr)
+
+    def _snapshot_state(self) -> Dict[str, Any]:
+        network = self.network
+        nodes_payload: List[Dict[str, Any]] = []
+        for node_id, node in network.nodes.items():
+            node_payload = {
+                "node_id": node_id,
+                "cpu_capacity": node.cpu_capacity,
+                "memory_capacity": node.memory_capacity,
+                "storage_gb": max(1, int(round(node.total_storage / (1024 ** 3)))) ,
+                "bandwidth_mbps": max(1, int(max(1, node.bandwidth) / 1_000_000)),
+                "zone": node.zone,
+                "root_id": network.node_roots.get(node_id, node_id),
+                "replica_parent": network.get_replica_parent(node_id),
+                "failed": node_id in network.failed_nodes,
+                "stored_files": self._serialize_node_files(node),
+            }
+            nodes_payload.append(node_payload)
+
+        links_payload: List[Dict[str, Any]] = []
+        seen_links: Set[Tuple[str, str]] = set()
+        for node_id, node in network.nodes.items():
+            for neighbor_id, bandwidth_bps in node.connections.items():
+                if neighbor_id not in network.nodes:
+                    continue
+                link_key = tuple(sorted((node_id, neighbor_id)))
+                if link_key in seen_links:
+                    continue
+                seen_links.add(link_key)
+                latency = (
+                    node.link_latencies.get(neighbor_id)
+                    or network.link_latency_ms.get((node_id, neighbor_id))
+                    or 0.0
+                )
+                links_payload.append(
+                    {
+                        "a": link_key[0],
+                        "b": link_key[1],
+                        "bandwidth_mbps": max(1, int(max(1, bandwidth_bps) / 1_000_000)),
+                        "latency_ms": latency,
+                    }
+                )
+
+        snapshot = {
+            "schema_version": 1,
+            "simulator": {"now": self.simulator.now},
+            "scaling_config": asdict(network.scaling),
+            "routing_strategy": network.routing_strategy,
+            "nodes": nodes_payload,
+            "links": links_payload,
+            "failed_nodes": list(network.failed_nodes),
+            "failed_links": [list(link) for link in network.failed_links],
+            "replica_parents": dict(network._replica_parents),
+            "node_roots": dict(network.node_roots),
+            "clusters": {root: sorted(nodes) for root, nodes in network.cluster_nodes.items()},
+            "events": list(self._events),
+        }
+        return snapshot
+
+    def _serialize_node_files(self, node: StorageVirtualNode) -> List[Dict[str, Any]]:
+        entries: List[Dict[str, Any]] = []
+        for transfer in node.stored_files.values():
+            metadata = node.disk.get_file_metadata(transfer.file_id) if hasattr(node, "disk") else None
+            entries.append(self._serialize_transfer(transfer, metadata))
+        return entries
+
+    def _serialize_transfer(self, transfer: FileTransfer, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "file_id": transfer.file_id,
+            "file_name": transfer.file_name,
+            "total_size": transfer.total_size,
+            "status": transfer.status.name,
+            "created_at": transfer.created_at,
+            "completed_at": transfer.completed_at,
+            "is_retrieval": transfer.is_retrieval,
+            "backing_file_id": transfer.backing_file_id,
+            "path": (metadata or {}).get("path"),
+            "chunks": [
+                {
+                    "chunk_id": chunk.chunk_id,
+                    "size": chunk.size,
+                    "checksum": chunk.checksum,
+                    "status": chunk.status.name,
+                    "stored_node": chunk.stored_node,
+                }
+                for chunk in transfer.chunks
+            ],
+        }
+
+    def _restore_state(self, snapshot: Dict[str, Any]) -> None:
+        self._restoring_state = True
+        try:
+            scaling_config = snapshot.get("scaling_config") or {}
+            self.network.scaling = DemandScalingConfig(**scaling_config)
+            simulator_now = snapshot.get("simulator", {}).get("now", 0.0)
+            self.simulator._clock = simulator_now  # type: ignore[attr-defined]
+            routing_strategy = snapshot.get("routing_strategy")
+            if routing_strategy:
+                self.network.routing_strategy = routing_strategy
+            auto_flag = self.network.scaling.auto_replication_enabled
+            self.network.scaling.auto_replication_enabled = False
+            for node_payload in snapshot.get("nodes", []):
+                node = StorageVirtualNode(
+                    node_payload["node_id"],
+                    cpu_capacity=node_payload.get("cpu_capacity", 8),
+                    memory_capacity=node_payload.get("memory_capacity", 32),
+                    storage_capacity=node_payload.get("storage_gb", 500),
+                    bandwidth=node_payload.get("bandwidth_mbps", 1000),
+                    zone=node_payload.get("zone"),
+                )
+                root_id = node_payload.get("root_id")
+                self.network.add_node(node, root_id=root_id, suppress_replica_coverage=True)
+                self._restore_node_files(node, node_payload.get("stored_files", []))
+            self.network.scaling.auto_replication_enabled = auto_flag
+
+            replica_parents = snapshot.get("replica_parents") or {}
+            self.network._replica_parents = dict(replica_parents)
+            node_roots = snapshot.get("node_roots") or {}
+            if node_roots:
+                self.network.node_roots.update(node_roots)
+            clusters = snapshot.get("clusters") or {}
+            if clusters:
+                self.network.cluster_nodes.clear()
+                for root, members in clusters.items():
+                    self.network.cluster_nodes[root] = set(members)
+
+            self._restore_links(snapshot.get("links", []))
+            failed_nodes = set(snapshot.get("failed_nodes", []))
+            self.network.failed_nodes = failed_nodes
+            failed_links = snapshot.get("failed_links", [])
+            self.network.failed_links = {tuple(pair) for pair in failed_links}
+
+            self._events.clear()
+            for event in snapshot.get("events", []):
+                self._events.append(event)
+        finally:
+            self._restoring_state = False
+
+    def _restore_links(self, links: List[Dict[str, Any]]) -> None:
+        for link in links:
+            node_a = link.get("a")
+            node_b = link.get("b")
+            if not node_a or not node_b:
+                continue
+            if node_a not in self.network.nodes or node_b not in self.network.nodes:
+                continue
+            bandwidth_mbps = max(1, int(link.get("bandwidth_mbps", 1)))
+            latency = link.get("latency_ms", 0.0)
+            bandwidth_bps = bandwidth_mbps * 1_000_000
+            self.network.nodes[node_a].connections[node_b] = bandwidth_bps
+            self.network.nodes[node_b].connections[node_a] = bandwidth_bps
+            self.network.nodes[node_a].link_latencies[node_b] = latency
+            self.network.nodes[node_b].link_latencies[node_a] = latency
+            self.network.link_latency_ms[(node_a, node_b)] = latency
+            self.network.link_latency_ms[(node_b, node_a)] = latency
+
+    def _restore_node_files(self, node: StorageVirtualNode, stored_files: List[Dict[str, Any]]) -> None:
+        for entry in stored_files:
+            chunks_payload = entry.get("chunks", [])
+            if not chunks_payload:
+                chunks_payload = [
+                    {
+                        "chunk_id": 0,
+                        "size": entry.get("total_size", 0),
+                        "checksum": None,
+                        "status": "COMPLETED",
+                        "stored_node": node.node_id,
+                    }
+                ]
+            chunks = [
+                FileChunk(
+                    chunk_id=chunk_payload.get("chunk_id", idx),
+                    size=chunk_payload.get("size", 0),
+                    checksum=chunk_payload.get("checksum"),
+                    status=self._status_from_name(chunk_payload.get("status", "COMPLETED")),
+                    stored_node=chunk_payload.get("stored_node"),
+                )
+                for idx, chunk_payload in enumerate(chunks_payload)
+            ]
+            transfer = FileTransfer(
+                file_id=entry["file_id"],
+                file_name=entry.get("file_name", entry["file_id"]),
+                total_size=entry.get("total_size", 0),
+                chunks=chunks,
+                status=self._status_from_name(entry.get("status", "COMPLETED")),
+                created_at=entry.get("created_at", 0.0),
+                completed_at=entry.get("completed_at"),
+                is_retrieval=entry.get("is_retrieval", False),
+                backing_file_id=entry.get("backing_file_id"),
+            )
+            transfer.status = TransferStatus.COMPLETED
+            transfer.completed_at = transfer.completed_at or self.simulator.now
+            node.stored_files[transfer.file_id] = transfer
+            path = entry.get("path") or f"/{node.node_id}/{transfer.file_name}"
+            node.disk.reserve_file(transfer.file_id, transfer.total_size, path=path)
+            for chunk in chunks:
+                node.disk.write_chunk(transfer.file_id, chunk.chunk_id, None, chunk.size)
+            node.total_requests_processed += 1
+            node.total_data_transferred += transfer.total_size
+
+    @staticmethod
+    def _status_from_name(value: str) -> TransferStatus:
+        try:
+            return TransferStatus[value]
+        except KeyError:
+            return TransferStatus.COMPLETED
 
 
 def parse_size(value: str) -> int:
