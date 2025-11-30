@@ -43,17 +43,22 @@ def test_parse_size_handles_suffixes():
 
 def test_controller_persists_state(tmp_path):
     state_path = tmp_path / "state.json"
-    controller = CloudSimController(enable_persistence=True, state_path=str(state_path))
+    controller = CloudSimController(enable_persistence=False)
     controller.add_node("persist-a", storage_gb=200)
     controller.add_node("persist-b", storage_gb=200)
     controller.connect_nodes("persist-a", "persist-b", bandwidth_mbps=500, latency_ms=1.0)
     transfer = controller.initiate_transfer("persist-a", "persist-b", "persist.bin", 5 * 1024 * 1024)
     controller.run_until_idle()
     assert transfer.completed_at is not None
-    assert state_path.exists()
 
-    restored = CloudSimController(enable_persistence=True, state_path=str(state_path))
-    info = restored.get_node_info("persist-b")
+    saved_path = controller.save_snapshot(str(state_path))
+    assert state_path.exists() and str(state_path) == saved_path
+
+    controller.reset_state()
+    assert controller.get_node_info("persist-b") is None
+
+    assert controller.load_snapshot(str(state_path))
+    info = controller.get_node_info("persist-b")
     assert info is not None
     stored_files = info.get("stored_files", [])
     assert any(entry["file_name"] == "persist.bin" for entry in stored_files)

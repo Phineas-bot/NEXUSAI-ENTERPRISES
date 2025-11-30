@@ -50,8 +50,9 @@ class CloudSimController:
         enable_persistence: bool = False,
         state_path: Optional[str] = None,
     ):
-        self.simulator = Simulator()
-        scaling = DemandScalingConfig(
+        self._tick_interval = tick_interval
+        self._event_history_limit = event_history
+        base_scaling = DemandScalingConfig(
             enabled=True,
             storage_utilization_threshold=0.7,
             bandwidth_utilization_threshold=0.9,
@@ -60,17 +61,13 @@ class CloudSimController:
             max_replicas_per_root=3,
             replica_seed_limit=None,
         )
-        self.network = StorageVirtualNetwork(
-            self.simulator,
-            tick_interval=tick_interval,
-            scaling_config=scaling,
-        )
-        self._events: Deque[Dict[str, object]] = deque(maxlen=event_history)
-        self.network.register_observer(self._record_event)
+        self._base_scaling_template = asdict(base_scaling)
         self._rng = random.Random()
         self._restoring_state = False
         self._persistence_enabled = enable_persistence
         self._state_store: Optional[CloudSimStateStore] = None
+        self._setup_runtime()
+
         if self._persistence_enabled:
             default_path = state_path or os.path.join(os.path.dirname(__file__), "cloudsim_state.json")
             self._state_store = CloudSimStateStore(default_path)
@@ -86,6 +83,17 @@ class CloudSimController:
 
     def recent_events(self, limit: int = 10) -> List[Dict[str, object]]:
         return list(self._events)[-limit:]
+
+    def _setup_runtime(self, scaling_override: Optional[DemandScalingConfig] = None) -> None:
+        config = scaling_override or DemandScalingConfig(**self._base_scaling_template)
+        self.simulator = Simulator()
+        self.network = StorageVirtualNetwork(
+            self.simulator,
+            tick_interval=self._tick_interval,
+            scaling_config=config,
+        )
+        self._events = deque(maxlen=self._event_history_limit)
+        self.network.register_observer(self._record_event)
 
     # Node management ----------------------------------------------------
     def add_node(
@@ -303,6 +311,46 @@ class CloudSimController:
             latency = round(rng.uniform(20.0, 80.0), 2)
         return bandwidth, latency
 
+    # Snapshot management -----------------------------------------------
+    def save_snapshot(self, path: Optional[str] = None) -> str:
+        snapshot = self._snapshot_state()
+        if path:
+            store = CloudSimStateStore(path)
+            store.save(snapshot)
+            return store.path
+        if not self._state_store:
+            raise RuntimeError("Persistence is disabled; provide a destination path")
+        self._state_store.save(snapshot)
+        return self._state_store.path
+
+    def load_snapshot(self, path: Optional[str] = None) -> bool:
+        store = None
+        if path:
+            store = CloudSimStateStore(path)
+            self._state_store = store
+            self._persistence_enabled = True
+        else:
+            store = self._state_store
+        if not store:
+            raise RuntimeError("No persistence backend configured")
+        snapshot = store.load()
+        if not snapshot:
+            return False
+        self._restore_state(snapshot, reset_runtime=True)
+        self._persist_state()
+        return True
+
+    def reset_state(self, *, clear_saved: bool = False) -> None:
+        self._setup_runtime()
+        if clear_saved and self._state_store:
+            self._state_store.clear()
+        self._persist_state()
+
+    def get_state_path(self) -> Optional[str]:
+        if not self._state_store:
+            return None
+        return self._state_store.path
+
     # Persistence -------------------------------------------------------
     def _persist_state(self) -> None:
         if not self._persistence_enabled or self._restoring_state or not self._state_store:
@@ -400,9 +448,11 @@ class CloudSimController:
             ],
         }
 
-    def _restore_state(self, snapshot: Dict[str, Any]) -> None:
+    def _restore_state(self, snapshot: Dict[str, Any], *, reset_runtime: bool = False) -> None:
         self._restoring_state = True
         try:
+            if reset_runtime:
+                self._setup_runtime()
             scaling_config = snapshot.get("scaling_config") or {}
             self.network.scaling = DemandScalingConfig(**scaling_config)
             simulator_now = snapshot.get("simulator", {}).get("now", 0.0)

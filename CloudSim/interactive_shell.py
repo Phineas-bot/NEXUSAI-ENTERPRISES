@@ -303,6 +303,44 @@ class CloudSimShell(cmd.Cmd):
             details = {k: v for k, v in event.items() if k not in {"type", "time"}}
             self._print(f"[{timestamp:0.2f}s] {event_type} {details}")
 
+    # Persistence -------------------------------------------------------
+    def do_save(self, arg: str) -> None:
+        """save [PATH] -- write a snapshot (defaults to the active workspace file)"""
+
+        tokens = self._parse(arg)
+        path = tokens[0] if tokens else None
+        try:
+            location = self.controller.save_snapshot(path)
+            self._print(f"State saved to {location}")
+        except Exception as exc:  # pylint: disable=broad-except
+            self._print(f"Save failed: {exc}")
+
+    def do_load(self, arg: str) -> None:
+        """load [PATH] -- restore a snapshot (switches autosave target when PATH provided)"""
+
+        tokens = self._parse(arg)
+        path = tokens[0] if tokens else None
+        try:
+            if self.controller.load_snapshot(path):
+                target = path or (self.controller.get_state_path() or "default")
+                self._print(f"Loaded snapshot from {target}")
+            else:
+                self._print("No snapshot found to load")
+        except Exception as exc:  # pylint: disable=broad-except
+            self._print(f"Load failed: {exc}")
+
+    def do_reset(self, arg: str) -> None:
+        """reset [--clear] -- reset to a blank topology (optionally delete the saved snapshot)"""
+
+        tokens = set(self._parse(arg))
+        clear = "--clear" in tokens
+        try:
+            self.controller.reset_state(clear_saved=clear)
+            suffix = " and cleared snapshot" if clear else ""
+            self._print(f"State reset{suffix}")
+        except Exception as exc:  # pylint: disable=broad-except
+            self._print(f"Reset failed: {exc}")
+
     # Exit ---------------------------------------------------------------
     def do_exit(self, arg: str) -> bool:  # pylint: disable=unused-argument
         """exit -- leave the shell"""

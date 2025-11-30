@@ -49,10 +49,14 @@ cloudsim> transfer node-a node-b demo.bin 200MB
 cloudsim> inspect node-b
 cloudsim> nodes --all
 cloudsim> events 5
+cloudsim> save backups/lab1.json
+cloudsim> load backups/lab1.json
+cloudsim> reset --clear
 ```
 
 The shell keeps the simulator alive so you can mark nodes offline (`fail node-b`), restore them, disconnect links, or inspect replica clusters in real time. Use `help` or `help <command>` from inside the shell to see the full catalog of actions.
 `connect` accepts more than two node IDs and links each adjacent pair, and `inspect NODE_ID` dumps bandwidth/storage telemetry, stored files, replica parents/children, and active transfers.
+`save [PATH]` writes a JSON snapshot (defaulting to `CloudSim/cloudsim_state.json`), `load [PATH]` restores a snapshot and switches the autosave target, and `reset [--clear]` wipes the in-memory topology (optionally deleting the saved snapshot).
 
 ### Persistent Sessions
 
