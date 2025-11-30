@@ -172,6 +172,46 @@ def test_replica_seed_runs_after_new_capacity():
     replica = network.nodes[replica_node_id]
     assert any(file_transfer.file_name == "hot.bin" for file_transfer in replica.stored_files.values())
 
+    def test_auto_replication_creates_two_replicas_per_root():
+        scaling = DemandScalingConfig(
+            enabled=True,
+            auto_replication_enabled=True,
+            min_replicas_per_root=2,
+            max_replicas_per_root=2,
+        )
+
+        sim, network = _build_network(scaling_config=scaling)
+        cluster_nodes = network.get_cluster_nodes("node-b")
+        assert len(cluster_nodes) == 3  # root + two replicas
+
+
+    def test_auto_replication_survives_parent_failure():
+        scaling = DemandScalingConfig(
+            enabled=True,
+            auto_replication_enabled=True,
+            min_replicas_per_root=2,
+            max_replicas_per_root=2,
+        )
+
+        sim, network = _build_network(scaling_config=scaling)
+        transfer = network.initiate_file_transfer("node-a", "node-b", "redundant.bin", 50 * 1024 * 1024)
+        assert transfer is not None
+        sim.run()
+
+        replicas = [node_id for node_id in network.get_cluster_nodes("node-b") if node_id != "node-b"]
+        assert len(replicas) == 2
+        for replica_id in replicas:
+            replica = network.nodes[replica_id]
+            assert any(t.backing_file_id == transfer.file_id for t in replica.stored_files.values())
+
+        assert network.fail_node("node-b")
+        healthy = [replica_id for replica_id in replicas if replica_id not in network.failed_nodes]
+        assert healthy
+
+        follow_up = network.initiate_file_transfer("node-a", "node-b", "post-failure.bin", 10 * 1024 * 1024)
+        assert follow_up is not None
+        sim.run()
+        assert follow_up.status == TransferStatus.COMPLETED
 
 def test_scaling_uses_telemetry_priorities():
     scaling = DemandScalingConfig(

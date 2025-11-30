@@ -7,7 +7,7 @@ from dataclasses import dataclass, asdict
 from typing import Deque, Dict, List, Optional, Tuple
 
 from simulator import Simulator
-from storage_virtual_network import StorageVirtualNetwork
+from storage_virtual_network import DemandScalingConfig, StorageVirtualNetwork
 from storage_virtual_node import StorageVirtualNode
 
 
@@ -41,7 +41,20 @@ class CloudSimController:
 
     def __init__(self, tick_interval: float = 0.005, event_history: int = 200):
         self.simulator = Simulator()
-        self.network = StorageVirtualNetwork(self.simulator, tick_interval=tick_interval)
+        scaling = DemandScalingConfig(
+            enabled=True,
+            storage_utilization_threshold=0.7,
+            bandwidth_utilization_threshold=0.9,
+            auto_replication_enabled=True,
+            min_replicas_per_root=2,
+            max_replicas_per_root=3,
+            replica_seed_limit=None,
+        )
+        self.network = StorageVirtualNetwork(
+            self.simulator,
+            tick_interval=tick_interval,
+            scaling_config=scaling,
+        )
         self._events: Deque[Dict[str, object]] = deque(maxlen=event_history)
         self.network.register_observer(self._record_event)
         self._rng = random.Random()
@@ -82,9 +95,12 @@ class CloudSimController:
     def remove_node(self, node_id: str) -> bool:
         return self.network.remove_node(node_id)
 
-    def list_node_status(self) -> List[NodeStatus]:
+    def list_node_status(self, include_replicas: bool = False) -> List[NodeStatus]:
         rows: List[NodeStatus] = []
         for node_id, node in self.network.nodes.items():
+            replica_parent = self.network.get_replica_parent(node_id)
+            if not include_replicas and replica_parent:
+                continue
             rows.append(
                 NodeStatus(
                     node_id=node_id,
@@ -93,7 +109,7 @@ class CloudSimController:
                     storage_total=node.total_storage,
                     bandwidth_bps=node.bandwidth,
                     zone=node.zone,
-                    replicas=self.network.get_replica_parent(node_id),
+                    replicas=replica_parent,
                 )
             )
         return rows
@@ -184,9 +200,28 @@ class CloudSimController:
             "neighbors": list(node.connections.keys()),
             "used_storage": node.used_storage,
             "total_storage": node.total_storage,
+            "available_storage": max(0, node.total_storage - node.used_storage),
             "bandwidth": node.bandwidth,
             "zone": node.zone,
             "replica_parent": self.network.get_replica_parent(node_id),
+            "replica_children": self.network.get_replica_children(node_id),
+            "stored_files": [
+                {
+                    "file_id": transfer.file_id,
+                    "file_name": transfer.file_name,
+                    "size_bytes": transfer.total_size,
+                    "completed_at": transfer.completed_at,
+                }
+                for transfer in node.stored_files.values()
+            ],
+            "active_transfers": [
+                {
+                    "file_id": transfer.file_id,
+                    "status": transfer.status.name,
+                    "size_bytes": transfer.total_size,
+                }
+                for transfer in node.active_transfers.values()
+            ],
         }
         if telemetry:
             info["telemetry"] = asdict(telemetry)

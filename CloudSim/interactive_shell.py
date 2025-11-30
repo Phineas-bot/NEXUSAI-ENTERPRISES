@@ -79,19 +79,22 @@ class CloudSimShell(cmd.Cmd):
         else:
             self._print(f"Node '{node_id}' not found")
 
-    def do_nodes(self, arg: str) -> None:  # pylint: disable=unused-argument
-        """nodes -- list current nodes and their status"""
+    def do_nodes(self, arg: str) -> None:
+        """nodes [--all] -- list current nodes and their status (replicas hidden unless --all)"""
 
-        rows = self.controller.list_node_status()
+        tokens = self._parse(arg)
+        include_replicas = bool(tokens and tokens[0] == "--all")
+        rows = self.controller.list_node_status(include_replicas=include_replicas)
         if not rows:
             self._print("No nodes configured")
             return
         for row in rows:
             status = "online" if row.online else "offline"
+            replica_hint = f" replica-of {row.replicas}" if row.replicas else ""
             self._print(
                 f"{row.node_id:12} {status:8} zone {row.zone or 'n/a':12} "
-                f"storage {row.storage_used}/{row.storage_total} bytes,"
-                f" bandwidth {row.bandwidth_bps} bps"
+                f"storage {row.storage_used}/{row.storage_total} bytes," 
+                f" bandwidth {row.bandwidth_bps} bps{replica_hint}"
             )
 
     def do_clusters(self, arg: str) -> None:  # pylint: disable=unused-argument
@@ -104,19 +107,91 @@ class CloudSimShell(cmd.Cmd):
         for root, members in clusters.items():
             self._print(f"{root}: {', '.join(members)}")
 
+    def do_inspect(self, arg: str) -> None:
+        """inspect NODE_ID -- display detailed telemetry for a node"""
+
+        node_id = arg.strip()
+        if not node_id:
+            self._print("Usage: inspect NODE_ID")
+            return
+        info = self.controller.get_node_info(node_id)
+        if not info:
+            self._print(f"Node '{node_id}' not found")
+            return
+
+        status = "online" if info.get("online") else "offline"
+        zone = info.get("zone") or "n/a"
+        self._print(f"Node {node_id} ({status}) zone={zone}")
+        used = info.get("used_storage", 0)
+        total = info.get("total_storage", 0)
+        available = info.get("available_storage", 0)
+        self._print(f"  Storage: {used}/{total} bytes (available {available})")
+        self._print(f"  Bandwidth: {info.get('bandwidth')} Mbps")
+
+        neighbors = info.get("neighbors") or []
+        self._print(f"  Neighbors: {', '.join(neighbors) if neighbors else 'none'}")
+
+        replica_parent = info.get("replica_parent")
+        replica_children = info.get("replica_children") or []
+        if replica_parent or replica_children:
+            parent_label = replica_parent or "none"
+            children_label = ", ".join(replica_children) if replica_children else "none"
+            self._print(f"  Replica parent: {parent_label}")
+            self._print(f"  Replica children: {children_label}")
+
+        stored_files = info.get("stored_files", [])
+        if stored_files:
+            self._print("  Stored files:")
+            for entry in stored_files:
+                name = entry.get("file_name") or entry.get("file_id")
+                size = entry.get("size_bytes", 0)
+                completed = entry.get("completed_at")
+                self._print(f"    - {name} ({size} bytes, completed_at={completed})")
+        else:
+            self._print("  Stored files: none")
+
+        active_transfers = info.get("active_transfers", [])
+        if active_transfers:
+            self._print("  Active transfers:")
+            for transfer in active_transfers:
+                file_id = transfer.get("file_id")
+                status = transfer.get("status")
+                size = transfer.get("size_bytes", 0)
+                self._print(f"    - {file_id} ({size} bytes) status={status}")
+        else:
+            self._print("  Active transfers: none")
+
+        telemetry = info.get("telemetry")
+        if telemetry:
+            self._print("  Telemetry:")
+            for key, value in telemetry.items():
+                self._print(f"    {key}: {value}")
+
     # Topology -----------------------------------------------------------
     def do_connect(self, arg: str) -> None:
-        """connect NODE_A NODE_B [--bandwidth 1000] [--latency 1.0]"""
+        """connect NODE_A NODE_B [NODE_C ...] [--bandwidth 1000] [--latency 1.0]
+
+        Connects adjacent node pairs (A-B, B-C, ...) in one command.
+        """
 
         tokens = self._parse(arg)
         if len(tokens) < 2:
-            self._print("Usage: connect NODE_A NODE_B [--bandwidth Mbps] [--latency ms]")
+            self._print("Usage: connect NODE_A NODE_B [NODE_C ...] [--bandwidth Mbps] [--latency ms]")
             return
-        node_a, node_b = tokens[:2]
+
+        node_ids: List[str] = []
+        idx = 0
+        while idx < len(tokens) and not tokens[idx].startswith("--"):
+            node_ids.append(tokens[idx])
+            idx += 1
+        if len(node_ids) < 2:
+            self._print("Provide at least two node IDs before any --options")
+            return
+
         bandwidth = None
         latency = None
         key = None
-        for token in tokens[2:]:
+        for token in tokens[idx:]:
             if token.startswith("--"):
                 key = token[2:]
                 continue
@@ -124,19 +199,28 @@ class CloudSimShell(cmd.Cmd):
                 bandwidth = int(token)
             elif key == "latency":
                 latency = float(token)
-        if self.controller.connect_nodes(node_a, node_b, bandwidth, latency):
-            link = self.controller.network.nodes.get(node_a)
-            bw_label = None
-            latency_label = None
-            if link and node_b in link.connections:
-                bw_label = max(1, int(link.connections[node_b] / 1_000_000))
-                latency_label = link.link_latencies.get(node_b, 0.0)
-            extra = ""
-            if bw_label is not None and latency_label is not None:
-                extra = f" ({bw_label} Mbps, {latency_label} ms)"
-            self._print(f"Connected {node_a} <-> {node_b}{extra}")
-        else:
-            self._print("Connection failed; ensure both nodes exist")
+
+        successes = []
+        failures = []
+        for left, right in zip(node_ids, node_ids[1:]):
+            if self.controller.connect_nodes(left, right, bandwidth, latency):
+                link = self.controller.network.nodes.get(left)
+                bw_label = None
+                latency_label = None
+                if link and right in link.connections:
+                    bw_label = max(1, int(link.connections[right] / 1_000_000))
+                    latency_label = link.link_latencies.get(right, 0.0)
+                extra = ""
+                if bw_label is not None and latency_label is not None:
+                    extra = f" ({bw_label} Mbps, {latency_label} ms)"
+                successes.append(f"{left} <-> {right}{extra}")
+            else:
+                failures.append(f"{left} <-> {right}")
+
+        if successes:
+            self._print("Connected: " + "; ".join(successes))
+        if failures:
+            self._print("Failed: " + "; ".join(failures) + " (verify nodes exist)")
 
     def do_disconnect(self, arg: str) -> None:
         """disconnect NODE_A NODE_B -- remove a link"""

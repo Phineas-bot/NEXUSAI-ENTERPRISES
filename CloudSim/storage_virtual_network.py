@@ -70,6 +70,8 @@ class DemandScalingConfig:
     os_memory_utilization_threshold: Optional[float] = None
     trigger_priority: Optional[List[str]] = None
     replica_seed_limit: Optional[int] = None
+    auto_replication_enabled: bool = False
+    min_replicas_per_root: int = 0
 
 
 class StorageVirtualNetwork:
@@ -104,6 +106,7 @@ class StorageVirtualNetwork:
         # Replica/cluster bookkeeping for decentralized scaling
         self.node_roots: Dict[str, str] = {}
         self.cluster_nodes: Dict[str, Set[str]] = defaultdict(set)
+        self._cluster_observers: List[Callable[[str, List[str]], None]] = []
 
         # Network topology and addressing
         self.link_latency_ms: Dict[Tuple[str, str], float] = {}
@@ -122,14 +125,13 @@ class StorageVirtualNetwork:
         self._register_node_cluster(node.node_id, root_id)
         self._os_failure_baseline.setdefault(node.node_id, node.os_process_failures)
         self.failed_nodes.discard(node.node_id)
+        self._ensure_replica_coverage(node.node_id)
         
     def connect_nodes(self, node1_id: str, node2_id: str, bandwidth: int, latency_ms: float = 1.0):
         """Connect two nodes with specified bandwidth and latency"""
         if node1_id in self.nodes and node2_id in self.nodes:
-            self.nodes[node1_id].add_connection(node2_id, bandwidth, latency_ms)
-            self.nodes[node2_id].add_connection(node1_id, bandwidth, latency_ms)
-            self.link_latency_ms[(node1_id, node2_id)] = latency_ms
-            self.link_latency_ms[(node2_id, node1_id)] = latency_ms
+            self._establish_link(node1_id, node2_id, bandwidth, latency_ms)
+            self._mirror_replica_links(node1_id, node2_id, bandwidth, latency_ms)
             return True
         return False
 
@@ -148,6 +150,9 @@ class StorageVirtualNetwork:
             self.cluster_nodes[root_id].discard(node_id)
             if not self.cluster_nodes[root_id]:
                 self.cluster_nodes.pop(root_id)
+            else:
+                self._notify_cluster_observers(root_id)
+                self._ensure_replica_coverage(root_id)
         self.failed_nodes.discard(node_id)
         self._replica_parents.pop(node_id, None)
         return True
@@ -179,11 +184,16 @@ class StorageVirtualNetwork:
         self.failed_nodes.add(node_id)
         self.nodes[node_id].network_utilization = 0.0
         self._handle_node_failure(node_id)
+        self._ensure_replica_coverage(node_id)
         return True
 
     def restore_node(self, node_id: str) -> None:
         self.failed_nodes.discard(node_id)
         self._recalculate_all_link_shares()
+
+    def register_cluster_observer(self, callback: Callable[[str, List[str]], None]) -> None:
+        if callback not in self._cluster_observers:
+            self._cluster_observers.append(callback)
     
     def initiate_file_transfer(
         self,
@@ -320,6 +330,9 @@ class StorageVirtualNetwork:
     def get_replica_parent(self, replica_id: str) -> Optional[str]:
         return self._replica_parents.get(replica_id)
 
+    def get_replica_children(self, parent_id: str) -> List[str]:
+        return self._get_replica_children(parent_id)
+
     def get_route(self, source_node_id: str, target_node_id: str) -> Optional[List[str]]:
         """Expose the currently computed routing path for testing/inspection."""
         return self._compute_route(source_node_id, target_node_id)
@@ -353,6 +366,22 @@ class StorageVirtualNetwork:
             target_node.connections.get(source_node_id, 0),
         )
         return float(min(link_bandwidth, source_node.bandwidth, target_node.bandwidth))
+
+    def _establish_link(self, node1_id: str, node2_id: str, bandwidth_mbps: int, latency_ms: float) -> None:
+        self.nodes[node1_id].add_connection(node2_id, bandwidth_mbps, latency_ms)
+        self.nodes[node2_id].add_connection(node1_id, bandwidth_mbps, latency_ms)
+        self.link_latency_ms[(node1_id, node2_id)] = latency_ms
+        self.link_latency_ms[(node2_id, node1_id)] = latency_ms
+
+    def _mirror_replica_links(self, node_a: str, node_b: str, bandwidth_mbps: int, latency_ms: float) -> None:
+        for replica_id in self._get_cluster_nodes(node_a):
+            if replica_id == node_a or replica_id not in self.nodes:
+                continue
+            self._establish_link(replica_id, node_b, bandwidth_mbps, latency_ms)
+        for replica_id in self._get_cluster_nodes(node_b):
+            if replica_id == node_b or replica_id not in self.nodes:
+                continue
+            self._establish_link(node_a, replica_id, bandwidth_mbps, latency_ms)
 
     def _neighbor_links(self, node_id: str) -> List[Tuple[str, float]]:
         if self._should_skip_node(node_id):
@@ -526,6 +555,7 @@ class StorageVirtualNetwork:
         self.node_roots[node_id] = root
         cluster = self.cluster_nodes.setdefault(root, set())
         cluster.add(node_id)
+        self._notify_cluster_observers(root)
 
     def _get_root_id(self, node_id: str) -> str:
         return self.node_roots.get(node_id, node_id)
@@ -535,7 +565,16 @@ class StorageVirtualNetwork:
         if root not in self.cluster_nodes and root in self.nodes:
             self.cluster_nodes[root] = {root}
             self.node_roots[root] = root
+            self._notify_cluster_observers(root)
         return self.cluster_nodes.get(root, set())
+
+    def _notify_cluster_observers(self, root_id: str) -> None:
+        cluster = sorted(self.cluster_nodes.get(root_id, set()))
+        for callback in self._cluster_observers:
+            try:
+                callback(root_id, cluster)
+            except Exception:
+                continue
 
     def _get_replica_children(self, parent_id: str) -> List[str]:
         return [replica_id for replica_id, recorded_parent in self._replica_parents.items() if recorded_parent == parent_id]
@@ -655,8 +694,10 @@ class StorageVirtualNetwork:
 
         return self._select_storage_node(requested_node_id, file_size)
 
-    def _spawn_replica_node(self, reference_node_id: str) -> Optional[str]:
-        if not self.scaling.enabled or reference_node_id not in self.nodes:
+    def _spawn_replica_node(self, reference_node_id: str, force: bool = False) -> Optional[str]:
+        if reference_node_id not in self.nodes:
+            return None
+        if not self.scaling.enabled and not force:
             return None
 
         root_id = self._get_root_id(reference_node_id)
@@ -679,7 +720,7 @@ class StorageVirtualNetwork:
         self.add_node(replica, root_id=root_id)
         self._replica_parents[replica_id] = reference_node_id
 
-        for neighbor_id, bandwidth_bps in reference_node.connections.items():
+        for neighbor_id, bandwidth_bps in list(reference_node.connections.items()):
             if neighbor_id not in self.nodes:
                 continue
             bandwidth_mbps = max(1, int(bandwidth_bps / 1000000))
@@ -689,7 +730,39 @@ class StorageVirtualNetwork:
         parent_link_bandwidth = max(1, int(reference_node.bandwidth / 1000000))
         self.connect_nodes(replica_id, reference_node.node_id, bandwidth=parent_link_bandwidth, latency_ms=1.0)
         self._schedule_replica_seed(reference_node_id, replica_id)
+        self._notify_cluster_observers(root_id)
         return replica_id
+
+    def _ensure_replica_coverage(self, node_id: str) -> None:
+        if not self.scaling.auto_replication_enabled:
+            return
+        desired = max(0, min(self.scaling.min_replicas_per_root, self.scaling.max_replicas_per_root))
+        if desired == 0:
+            return
+        root_id = self._get_root_id(node_id)
+        cluster = self._get_cluster_nodes(root_id)
+        healthy = [
+            member_id
+            for member_id in cluster
+            if member_id != root_id and member_id in self.nodes and member_id not in self.failed_nodes
+        ]
+        missing = desired - len(healthy)
+        if missing <= 0:
+            return
+
+        while missing > 0:
+            reference_candidates = [root_id, *healthy]
+            reference_id = next(
+                (candidate for candidate in reference_candidates if candidate in self.nodes and candidate not in self.failed_nodes),
+                None,
+            )
+            if not reference_id:
+                break
+            replica_id = self._spawn_replica_node(reference_id, force=True)
+            if not replica_id:
+                break
+            healthy.append(replica_id)
+            missing -= 1
 
     def _schedule_replica_seed(self, source_node_id: str, replica_id: str, attempt: int = 0) -> None:
         if self.scaling.replica_seed_limit == 0:
@@ -718,7 +791,8 @@ class StorageVirtualNetwork:
         for transfer in stored_files:
             if seeded >= seed_limit:
                 break
-            if transfer.file_id in replica_backing_ids:
+            backing_id = transfer.backing_file_id or transfer.file_id
+            if backing_id in replica_backing_ids:
                 continue
             route = self._compute_route(source_node_id, replica_id)
             if not route or len(route) < 2:
@@ -726,6 +800,7 @@ class StorageVirtualNetwork:
             replica_transfer = self.initiate_replica_transfer(source_node_id, replica_id, transfer.file_id)
             if replica_transfer:
                 seeded += 1
+                replica_backing_ids.add(backing_id)
 
     def _is_node_overloaded(self, node: StorageVirtualNode) -> Tuple[bool, Optional[str], Optional[NodeTelemetry]]:
         cause = self._node_overload_cause(node)
@@ -1130,5 +1205,8 @@ class StorageVirtualNetwork:
 
         if file_id in self.transfer_operations[source_node_id]:
             del self.transfer_operations[source_node_id][file_id]
+
+        self._ensure_replica_coverage(target_node_id)
+
         for replica_id in self._get_replica_children(target_node_id):
             self._schedule_replica_seed(target_node_id, replica_id)
