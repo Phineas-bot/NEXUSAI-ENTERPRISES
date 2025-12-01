@@ -655,3 +655,204 @@ class SharingService(object):
             timeout,
             metadata,
             _registered_method=True)
+
+
+class ObservabilityServiceStub(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def __init__(self, channel):
+        """Constructor.
+
+        Args:
+            channel: A grpc.Channel.
+        """
+        self.ListDashboards = channel.unary_unary(
+                '/cloud_drive.api.v1.ObservabilityService/ListDashboards',
+                request_serializer=control__plane__pb2.ListDashboardsRequest.SerializeToString,
+                response_deserializer=control__plane__pb2.ListDashboardsResponse.FromString,
+                _registered_method=True)
+        self.ListSLOs = channel.unary_unary(
+                '/cloud_drive.api.v1.ObservabilityService/ListSLOs',
+                request_serializer=control__plane__pb2.ListSLOsRequest.SerializeToString,
+                response_deserializer=control__plane__pb2.ListSLOsResponse.FromString,
+                _registered_method=True)
+        self.UpsertSLO = channel.unary_unary(
+                '/cloud_drive.api.v1.ObservabilityService/UpsertSLO',
+                request_serializer=control__plane__pb2.UpsertSLORequest.SerializeToString,
+                response_deserializer=control__plane__pb2.UpsertSLOResponse.FromString,
+                _registered_method=True)
+        self.DeleteSLO = channel.unary_unary(
+                '/cloud_drive.api.v1.ObservabilityService/DeleteSLO',
+                request_serializer=control__plane__pb2.DeleteSLORequest.SerializeToString,
+                response_deserializer=control__plane__pb2.DeleteSLOResponse.FromString,
+                _registered_method=True)
+
+
+class ObservabilityServiceServicer(object):
+    """Missing associated documentation comment in .proto file."""
+
+    def ListDashboards(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListSLOs(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def UpsertSLO(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeleteSLO(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+
+def add_ObservabilityServiceServicer_to_server(servicer, server):
+    rpc_method_handlers = {
+            'ListDashboards': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListDashboards,
+                    request_deserializer=control__plane__pb2.ListDashboardsRequest.FromString,
+                    response_serializer=control__plane__pb2.ListDashboardsResponse.SerializeToString,
+            ),
+            'ListSLOs': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListSLOs,
+                    request_deserializer=control__plane__pb2.ListSLOsRequest.FromString,
+                    response_serializer=control__plane__pb2.ListSLOsResponse.SerializeToString,
+            ),
+            'UpsertSLO': grpc.unary_unary_rpc_method_handler(
+                    servicer.UpsertSLO,
+                    request_deserializer=control__plane__pb2.UpsertSLORequest.FromString,
+                    response_serializer=control__plane__pb2.UpsertSLOResponse.SerializeToString,
+            ),
+            'DeleteSLO': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeleteSLO,
+                    request_deserializer=control__plane__pb2.DeleteSLORequest.FromString,
+                    response_serializer=control__plane__pb2.DeleteSLOResponse.SerializeToString,
+            ),
+    }
+    generic_handler = grpc.method_handlers_generic_handler(
+            'cloud_drive.api.v1.ObservabilityService', rpc_method_handlers)
+    server.add_generic_rpc_handlers((generic_handler,))
+    server.add_registered_method_handlers('cloud_drive.api.v1.ObservabilityService', rpc_method_handlers)
+
+
+ # This class is part of an EXPERIMENTAL API.
+class ObservabilityService(object):
+    """Missing associated documentation comment in .proto file."""
+
+    @staticmethod
+    def ListDashboards(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cloud_drive.api.v1.ObservabilityService/ListDashboards',
+            control__plane__pb2.ListDashboardsRequest.SerializeToString,
+            control__plane__pb2.ListDashboardsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListSLOs(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cloud_drive.api.v1.ObservabilityService/ListSLOs',
+            control__plane__pb2.ListSLOsRequest.SerializeToString,
+            control__plane__pb2.ListSLOsResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def UpsertSLO(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cloud_drive.api.v1.ObservabilityService/UpsertSLO',
+            control__plane__pb2.UpsertSLORequest.SerializeToString,
+            control__plane__pb2.UpsertSLOResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeleteSLO(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/cloud_drive.api.v1.ObservabilityService/DeleteSLO',
+            control__plane__pb2.DeleteSLORequest.SerializeToString,
+            control__plane__pb2.DeleteSLOResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)

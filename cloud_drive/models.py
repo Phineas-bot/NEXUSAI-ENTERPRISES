@@ -38,6 +38,9 @@ class FileEntry:
     created_by: str
     created_at: datetime
     updated_at: datetime
+    deleted_at: Optional[datetime] = None
+    deleted_by: Optional[str] = None
+    labels: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -79,6 +82,22 @@ class FileManifest:
 
 
 @dataclass
+class FileVersion:
+    version_id: str
+    file_id: str
+    manifest_id: str
+    version_number: int
+    created_by: str
+    created_at: datetime
+    size_bytes: int
+    parent_version_id: Optional[str] = None
+    change_summary: Optional[str] = None
+    autosave: bool = False
+    is_pinned: bool = False
+    label: Optional[str] = None
+
+
+@dataclass
 class ChunkStatus:
     chunk_id: int
     offset: int
@@ -92,11 +111,13 @@ class ChunkStatus:
 class UploadSession:
     session_id: str
     file_id: Optional[str]
+    org_id: str
     parent_id: str
     expected_size: int
     chunk_size: int
     created_by: str
     expires_at: datetime
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     received_bytes: int = 0
     file_name: Optional[str] = None
     source_node: Optional[str] = None
@@ -106,6 +127,33 @@ class UploadSession:
     status: str = "open"
     last_activity_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     client_hints: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class ShareGrant:
+    share_id: str
+    file_id: str
+    principal_type: str
+    principal_id: str
+    permission: str
+    created_by: str
+    created_at: datetime
+    expires_at: Optional[datetime] = None
+    link_token: Optional[str] = None
+    password_hash: Optional[str] = None
+
+
+@dataclass
+class SearchDocument:
+    file_id: str
+    org_id: str
+    name: str
+    labels: List[str]
+    owners: List[str]
+    principals: List[str]
+    mime_type: str
+    size_bytes: int
+    updated_at: datetime
 
 
 @dataclass

@@ -228,6 +228,54 @@ message DownloadChunk {
   bool eof = 3;
 }
 
+message Dashboard {
+  string id = 1;
+  string title = 2;
+  string definition_json = 3;
+}
+
+message ListDashboardsRequest {
+  RequestContext context = 1;
+}
+
+message ListDashboardsResponse {
+  repeated Dashboard dashboards = 1;
+}
+
+message SLO {
+  string name = 1;
+  string metric = 2;
+  double threshold = 3;
+  string comparator = 4;
+  int32 window_minutes = 5;
+}
+
+message ListSLOsRequest {
+  RequestContext context = 1;
+}
+
+message ListSLOsResponse {
+  repeated SLO slos = 1;
+}
+
+message UpsertSLORequest {
+  RequestContext context = 1;
+  SLO slo = 2;
+}
+
+message UpsertSLOResponse {
+  SLO slo = 1;
+}
+
+message DeleteSLORequest {
+  RequestContext context = 1;
+  string name = 2;
+}
+
+message DeleteSLOResponse {
+  bool deleted = 1;
+}
+
 service FilesService {
   rpc CreateFile(CreateFileRequest) returns (FileResource);
   rpc GetFile(GetFileRequest) returns (FileResource);
@@ -250,4 +298,11 @@ service OperationsService {
 service SharingService {
   rpc ShareFile(ShareFileRequest) returns (ShareFileResponse);
   rpc ListShares(ListSharesRequest) returns (ListSharesResponse);
+}
+
+service ObservabilityService {
+  rpc ListDashboards(ListDashboardsRequest) returns (ListDashboardsResponse);
+  rpc ListSLOs(ListSLOsRequest) returns (ListSLOsResponse);
+  rpc UpsertSLO(UpsertSLORequest) returns (UpsertSLOResponse);
+  rpc DeleteSLO(DeleteSLORequest) returns (DeleteSLOResponse);
 }

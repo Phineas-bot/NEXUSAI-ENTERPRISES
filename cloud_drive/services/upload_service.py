@@ -38,10 +38,12 @@ class UploadOrchestrator(BaseService):
 
     def initiate_session(
         self,
+        org_id: str,
         parent_id: str,
         size_bytes: int,
         created_by: str,
         *,
+        file_id: Optional[str] = None,
         chunk_size: int | None = None,
         client_hints: Optional[Dict[str, str]] = None,
         max_parallel_streams: Optional[int] = None,
@@ -49,16 +51,20 @@ class UploadOrchestrator(BaseService):
         session_id = str(uuid.uuid4())
         negotiated_chunk = self._negotiate_chunk_size(size_bytes, chunk_size, client_hints)
         streams = max_parallel_streams or self._suggest_parallel_streams(size_bytes, client_hints)
+        now = self._now()
         session = UploadSession(
             session_id=session_id,
-            file_id=None,
+            file_id=file_id,
+            org_id=org_id,
             parent_id=parent_id,
             expected_size=size_bytes,
             chunk_size=negotiated_chunk,
             created_by=created_by,
-            expires_at=self._now() + SESSION_TTL,
+            expires_at=now + SESSION_TTL,
+            created_at=now,
             max_parallel_streams=streams,
             client_hints=client_hints or {},
+            last_activity_at=now,
         )
         self.sessions[session_id] = session
         self.emit_event("upload_session_initiated", session_id=session_id)
@@ -129,9 +135,22 @@ class UploadOrchestrator(BaseService):
         if session.status != "ready":
             raise RuntimeError("Upload incomplete")
         manifest = self._materialize_manifest(session)
+        if session.file_id:
+            manifest.file_id = session.file_id
+        else:
+            session.file_id = manifest.file_id
         self.metadata_service.register_manifest(manifest)
-        session.file_id = manifest.file_id
         session.manifest_id = manifest.manifest_id
+        mime_type = self._infer_mime_type(session.file_name)
+        self.metadata_service.ensure_file_entry(
+            file_id=session.file_id,
+            org_id=session.org_id,
+            parent_id=session.parent_id,
+            name=session.file_name or f"object-{session.session_id}",
+            mime_type=mime_type,
+            size_bytes=session.expected_size,
+            created_by=session.created_by,
+        )
         if self.replica_manager:
             manifest = self.replica_manager.enforce_policy(manifest)
         if self.lifecycle_manager:
@@ -142,9 +161,19 @@ class UploadOrchestrator(BaseService):
         if self.durability_manager:
             manifest = self.durability_manager.apply(manifest, actor=session.created_by)
         self.metadata_service.upsert_manifest(manifest)
+        self.metadata_service.record_version(
+            file_id=session.file_id,
+            manifest_id=manifest.manifest_id,
+            size_bytes=session.expected_size,
+            actor=session.created_by,
+            change_summary="upload",
+        )
         session.status = "finalized"
         self.bus.publish(MessageEnvelope(topic="replication.requests", payload={"session_id": session_id}))
         self.emit_metric("upload_finalize", 1, session_id=session_id)
+        duration = self._now() - session.created_at
+        latency_ms = max(0.0, duration.total_seconds() * 1000)
+        self.emit_metric("ingest.latency_ms", latency_ms, org_id=session.org_id)
         return manifest
 
     def abort(self, session_id: str) -> None:
@@ -209,6 +238,21 @@ class UploadOrchestrator(BaseService):
             total_size=manifest.total_size,
             segments=segments,
         )
+
+    @staticmethod
+    def _infer_mime_type(file_name: Optional[str]) -> str:
+        if not file_name:
+            return "application/octet-stream"
+        lowered = file_name.lower()
+        if lowered.endswith(".txt"):
+            return "text/plain"
+        if lowered.endswith(".jpg") or lowered.endswith(".jpeg"):
+            return "image/jpeg"
+        if lowered.endswith(".png"):
+            return "image/png"
+        if lowered.endswith(".pdf"):
+            return "application/pdf"
+        return "application/octet-stream"
 
     def _default_source_node(self) -> str:
         nodes = list(self.controller.network.nodes.keys())

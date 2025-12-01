@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import threading
@@ -14,7 +15,8 @@ from typing import Dict, Iterable, Optional
 import grpc
 from google.protobuf.timestamp_pb2 import Timestamp
 
-from ..models import FileEntry, UploadSession
+from ..models import FileEntry, FileVersion, UploadSession
+from ..services.observability_service import SLODefinition
 from ..runtime import CloudDriveRuntime
 from . import control_plane_pb2 as pb2
 from . import control_plane_pb2_grpc as pb2_grpc
@@ -27,7 +29,7 @@ def _ts(dt: Optional[datetime]) -> Timestamp:
     return stamp
 
 
-def _file_entry_to_proto(entry: FileEntry) -> pb2.FileResource:
+def _file_entry_to_proto(entry: FileEntry, versions: Optional[Iterable[FileVersion]] = None) -> pb2.FileResource:
     resource = pb2.FileResource(
         id=entry.id,
         org_id=entry.org_id,
@@ -41,7 +43,24 @@ def _file_entry_to_proto(entry: FileEntry) -> pb2.FileResource:
     )
     resource.created_at.CopyFrom(_ts(entry.created_at))
     resource.updated_at.CopyFrom(_ts(entry.updated_at))
+    if versions:
+        for version in versions:
+            resource.versions.append(_version_to_proto(version))
     return resource
+
+
+def _version_to_proto(version: FileVersion) -> pb2.FileVersion:
+    message = pb2.FileVersion(
+        id=version.version_id,
+        file_id=version.file_id,
+        manifest_id=version.manifest_id,
+        size_bytes=version.size_bytes,
+        version_number=version.version_number,
+        retention_tier="hot",
+        created_by=version.created_by,
+    )
+    message.created_at.CopyFrom(_ts(version.created_at))
+    return message
 
 
 def _upload_session_to_proto(session: UploadSession) -> pb2.UploadSession:
@@ -67,6 +86,21 @@ def _share_to_proto(file_id: str, principal: str) -> pb2.Share:
         principal_id=principal,
         permission="editor",
     )
+
+
+def _slo_to_proto(slo: SLODefinition) -> pb2.SLO:
+    return pb2.SLO(
+        name=slo.name,
+        metric=slo.metric,
+        threshold=float(slo.threshold),
+        comparator=slo.comparator,
+        window_minutes=slo.window_minutes,
+    )
+
+
+def _ops_admin_roles(runtime: CloudDriveRuntime) -> set[str]:
+    config_roles = getattr(runtime.config.auth, "ops_admin_roles", None)
+    return set(config_roles or ["ops.admin"])
 
 
 class OperationStore:
@@ -127,7 +161,8 @@ class FilesServiceHandler(pb2_grpc.FilesServiceServicer):
             entry = self.runtime.api_gateway.get_file(request.file_id)
         except KeyError:
             context.abort(grpc.StatusCode.NOT_FOUND, f"file {request.file_id} not found")
-        return _file_entry_to_proto(entry)
+        versions = self.runtime.api_gateway.list_versions(request.file_id)
+        return _file_entry_to_proto(entry, versions)
 
     def ListFiles(self, request: pb2.ListFilesRequest, context: grpc.ServicerContext) -> pb2.ListFilesResponse:  # noqa: N802
         children = self.runtime.api_gateway.list_children(request.parent_id or None)
@@ -142,10 +177,13 @@ class UploadsServiceHandler(pb2_grpc.UploadsServiceServicer):
     def CreateSession(self, request: pb2.CreateUploadSessionRequest, context: grpc.ServicerContext) -> pb2.CreateUploadSessionResponse:  # noqa: N802
         if not request.parent_id:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "parent_id is required")
+        org_id = _resolve_org(request.context)
         session = self.runtime.api_gateway.start_upload(
+            org_id,
             request.parent_id,
             request.size_bytes,
             _resolve_user(request.context),
+            file_id=request.file_id or None,
             chunk_size=request.chunk_size or None,
         )
         proto_session = _upload_session_to_proto(session)
@@ -278,6 +316,70 @@ class SharingServiceHandler(pb2_grpc.SharingServiceServicer):
         return pb2.ListSharesResponse(grants=[_share_to_proto(request.file_id, p) for p in principals])
 
 
+class ObservabilityServiceHandler(pb2_grpc.ObservabilityServiceServicer):
+    def __init__(self, runtime: CloudDriveRuntime) -> None:
+        self.runtime = runtime
+
+    def ListDashboards(self, request: pb2.ListDashboardsRequest, context: grpc.ServicerContext) -> pb2.ListDashboardsResponse:  # noqa: N802
+        manager = getattr(self.runtime, "observability_manager", None)
+        dashboards = []
+        if manager:
+            for dashboard_id, definition in manager.dashboards.items():
+                title = str(definition.get("title", dashboard_id)) if isinstance(definition, dict) else dashboard_id
+                try:
+                    definition_json = json.dumps(definition)
+                except TypeError:
+                    definition_json = json.dumps({"raw": str(definition)})
+                dashboards.append(
+                    pb2.Dashboard(
+                        id=dashboard_id,
+                        title=title,
+                        definition_json=definition_json,
+                    )
+                )
+        return pb2.ListDashboardsResponse(dashboards=dashboards)
+
+    def ListSLOs(self, request: pb2.ListSLOsRequest, context: grpc.ServicerContext) -> pb2.ListSLOsResponse:  # noqa: N802
+        manager = getattr(self.runtime, "observability_manager", None)
+        if not manager:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "observability manager unavailable")
+        return pb2.ListSLOsResponse(slos=[_slo_to_proto(slo) for slo in manager.slo_definitions])
+
+    def UpsertSLO(self, request: pb2.UpsertSLORequest, context: grpc.ServicerContext) -> pb2.UpsertSLOResponse:  # noqa: N802
+        manager = getattr(self.runtime, "observability_manager", None)
+        if not manager:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "observability manager unavailable")
+        self._require_admin(request.context, context)
+        slo_proto = request.slo
+        if not slo_proto.name:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "slo.name is required")
+        if not slo_proto.metric:
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "slo.metric is required")
+        slo = SLODefinition(
+            name=slo_proto.name,
+            metric=slo_proto.metric,
+            threshold=slo_proto.threshold,
+            comparator=slo_proto.comparator or ">=",
+            window_minutes=slo_proto.window_minutes or 1,
+        )
+        stored = manager.upsert_slo(slo)
+        return pb2.UpsertSLOResponse(slo=_slo_to_proto(stored))
+
+    def DeleteSLO(self, request: pb2.DeleteSLORequest, context: grpc.ServicerContext) -> pb2.DeleteSLOResponse:  # noqa: N802
+        manager = getattr(self.runtime, "observability_manager", None)
+        if not manager:
+            context.abort(grpc.StatusCode.UNAVAILABLE, "observability manager unavailable")
+        self._require_admin(request.context, context)
+        deleted = manager.remove_slo(request.name)
+        return pb2.DeleteSLOResponse(deleted=deleted)
+
+    def _require_admin(self, ctx: Optional[pb2.RequestContext], grpc_context: grpc.ServicerContext) -> None:
+        scopes = set(ctx.scopes) if ctx else set()
+        if scopes.intersection(_ops_admin_roles(self.runtime)):
+            return
+        grpc_context.abort(grpc.StatusCode.PERMISSION_DENIED, "ops.admin role required")
+
+
 def build_grpc_server(runtime: Optional[CloudDriveRuntime] = None, *, max_workers: int = 8) -> grpc.Server:
     """Create a configured gRPC server without binding ports."""
 
@@ -289,6 +391,7 @@ def build_grpc_server(runtime: Optional[CloudDriveRuntime] = None, *, max_worker
     pb2_grpc.add_UploadsServiceServicer_to_server(UploadsServiceHandler(runtime, operation_store), server)
     pb2_grpc.add_OperationsServiceServicer_to_server(OperationsServiceHandler(operation_store), server)
     pb2_grpc.add_SharingServiceServicer_to_server(SharingServiceHandler(runtime), server)
+    pb2_grpc.add_ObservabilityServiceServicer_to_server(ObservabilityServiceHandler(runtime), server)
     return server
 
 

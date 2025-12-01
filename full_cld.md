@@ -259,6 +259,29 @@
 
 7. **Testing & Rollout**
 	- Prompt: “Create the testing matrix: unit coverage goals, integration suites (API + chunk router), load tests (multi-GB uploads, 1000s of concurrent clients), chaos experiments (node/link failure, corruption).”
+	- Response:
+		1. **Unit coverage**: Maintain ≥85% line coverage for core libraries (CloudSim runtime, controllers, services). Enforce via CI coverage gate; focus on deterministic logic (routing, manifest bookkeeping, auth helpers). Add mutation tests for policy engines and ACL evaluators.
+		2. **Integration suites**: Daily runs of REST + gRPC API suites (FastAPI + server harness) plus chunk-router workflows that drive actual uploads/downloads through the simulated network. Contract tests validate proto/JSON surfaces against golden fixtures.
+		3. **Load/perf**: K6/Locust scenarios push resumable uploads up to 50 MB per user and 50 concurrent clients. Capture p95 latency, throughput, and error budget burn; wire into Grafana synthetic dashboards. Storage fabric soak tests stream multi-hour replica fan-outs to detect memory leaks.
+		4. **Chaos/Resilience**: Scheduled chaos suite flips node/link health, injects disk corruption, pauses message-bus partitions, and verifies healing + replica rebuild SLAs. Runs weekly in staging with automated reports and Jira tickets for regressions.
+		5. **Tooling**: Categorize cases in a living matrix (spreadsheet + markdown) mapping features to test layers (unit/integration/load/chaos) so new epics cannot ship without coverage sign-off.
 	- Prompt: “Plan staging environments mirroring production topology, with synthetic data seeding and replay harnesses.”
+	- Response:
+		1. **Topology parity**: Staging mirrors prod scale-down (≥3 AZs, multi-region control plane, same service mesh + ingress). All feature flags default-on here before production.
+		2. **Synthetic data**: Seeder job creates orgs/users with diverse ACLs, uploads tiered datasets (small docs → multi-GB media), and populates shares/comments so search/activity flows stay warm. Data refreshes weekly to avoid drift.
+		3. **Replay harnesses**: Capture anonymized prod traces (API + bus events), scrub PII, and replay through staging to validate performance plus regression of workflow-specific bugs. Harness supports time compression and selective amplification (e.g., double upload rate).
+		4. **Isolation**: Separate staging tenants per squad with namespaced credentials and budget quotas. Observability hooks mirror prod dashboards for direct comparison (same alerts but Slack-only, no paging).
 	- Prompt: “Outline CI/CD pipeline: linting, tests, canary deploys, feature flags, rollback triggers, database migration safety.”
+	- Response:
+		1. **Pipeline stages**: (a) Lint/format (ruff/black, mypy, markdownlint), (b) Unit tests + coverage gate, (c) Integration/API tests against ephemeral services (docker-compose), (d) Build artifacts (containers, wheels), (e) Deploy-to-staging via GitOps.
+		2. **Canary + progressive delivery**: After staging green, Argo Rollouts/Flagger shift 10% of prod traffic to canary pods while monitoring SLO KPIs and error budgets. Feature flags (LaunchDarkly/OpenFeature) gate new endpoints so behavior can be toggled without redeploy.
+		3. **Rollback triggers**: Automated rollback on SLO breach, error-rate spike, or failed synthetic checks. Manual override available via ChatOps command logging reason + remediation.
+		4. **DB migrations**: Alembic migrations run with `--sql` dry-run, auto-generated plan review, shadow tables for destructive changes, and post-deploy smoke queries. Online schema changes (add columns nullable, backfill, then enforce). CI blocks merge unless migration plan + rollback notes present.
+		5. **Security gates**: Dependency scanning (Snyk/Trivy), container image signing (cosign), and SBOM export per build. Failing security stage blocks promotion.
 	- Prompt: “Define release management: versioning, change management approvals, customer communication cadence, beta programs.”
+	- Response:
+		1. **Versioning**: Semantic versioning for API/control-plane components; simulator-only changes use build metadata suffix. Public APIs require minor/major bumps with deprecation window tracked in docs.
+		2. **Change approval**: CAB reviews any change touching persistence, networking, or auth. Lightweight peer approval for UI-only tweaks. All releases require linked design/test artifacts and sign-off from owning squad + SRE.
+		3. **Cadence & comms**: Bi-weekly regular releases; urgent fixes follow hotfix path with retro audit. Release notes auto-generated from conventional commits, published to docs portal + customer mailing list with highlights and required actions.
+		4. **Beta/feature rollout**: Opt-in beta cohorts per org; feature flags scoped so early adopters can trial new flows (e.g., erasure coding UI). Feedback loops via in-product surveys + CSM syncs, with exit criteria defined before GA.
+		5. **Post-release validation**: 24h heightened monitoring, automated smoke tests, and customer-support checklist to confirm no spike in tickets. Incident reviews feed back into release checklist updates.

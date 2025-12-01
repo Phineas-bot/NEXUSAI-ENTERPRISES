@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 
@@ -34,6 +35,8 @@ class AuthConfig:
     audience: str
     jwks_url: Optional[str] = None
     service_mesh_domain: str = "mesh.local"
+    shared_secret: Optional[str] = None
+    ops_admin_roles: List[str] = field(default_factory=lambda: ["ops.admin"])
 
 
 @dataclass
@@ -81,6 +84,10 @@ class ObservabilityConfig:
     metrics_endpoint: str = "http://localhost:9090"
     tracing_endpoint: str = "http://localhost:4317"
     log_level: str = "INFO"
+    state_path: Optional[str] = field(default_factory=lambda: str((Path.home() / ".nexusai" / "observability_state.json")))
+    state_encryption_key: Optional[str] = None
+    dashboards: Dict[str, dict] = field(default_factory=dict)
+    slo_definitions: List[Dict[str, object]] = field(default_factory=list)
 
 
 @dataclass

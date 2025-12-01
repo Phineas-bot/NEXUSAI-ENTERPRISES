@@ -77,6 +77,9 @@ def test_files_and_uploads_flow(grpc_channel):
     assert finalize.operation.done
     assert finalize.operation.metadata.resource_id
 
+    fetched_file = files_stub.GetFile(pb2.GetFileRequest(context=context, file_id=finalize.operation.metadata.resource_id))
+    assert fetched_file.versions, "expected versions to be populated"
+
     fetched = operations_stub.Get(pb2.GetOperationRequest(context=context, operation_id=finalize.operation.operation_id))
     assert fetched.operation_id == finalize.operation.operation_id
     assert fetched.done
