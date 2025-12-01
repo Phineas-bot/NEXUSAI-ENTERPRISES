@@ -30,22 +30,20 @@ staging/
 Purpose: ensure staging constantly exercises ACLs, search, replication, and notifications.
 
 1. Run `python -m CloudSim.main --scenario hotspot` to warm the topology.
-2. Execute `python scripts/seed_demo_data.py --env staging` (script to be authored) to:
-   - Create multiple orgs/users with varied roles.
-   - Upload tiered datasets (KB docs → 10+ GB media) using resumable sessions.
-   - Apply sharing permissions, comments, and activity feed events.
-3. Schedule the seeder weekly (Task Scheduler/Cron) to refresh datasets and expire stale sessions.
+2. Execute `python scripts/seed_demo_data.py --rest-base https://staging.api --grpc-addr staging.api:50051 --dataset-root sample_data` to:
+  - Stream tiered datasets (KB docs → GB csv/video) from `sample_data/datasets` via resumable sessions.
+  - Hydrate knowledge-base docs from `sample_data/documents` with ACL variations.
+  - Seed observability dashboards + SLOs through the gRPC control plane (requires `CLOUDSIM_GRPC_ADDR`).
+3. Schedule the seeder weekly (Task Scheduler/Cron) with refreshed sample data to rotate activity feeds and expire stale sessions. The repo ships a GitHub Action (`.github/workflows/staging_refresh.yml`) that can run twice weekly using organization secrets to satisfy this requirement automatically.
 
 ## Replay Harness
 
-- Capture anonymized REST/gRPC traces or message-bus envelopes from production (redacted) into `replay_traces/DATE/*.json`.
-- Use `python scripts/replay_traffic.py --trace replay_traces/2025-12-01/uploads.json --speedup 5` to re-emit traffic against staging.
+- Capture anonymized REST/gRPC traces or message-bus envelopes from production (redacted) into `replay_traces/DATE/*.json` (see `sample_data/traces/observability_seed.json` for schema).
+- Use `python scripts/replay_traffic.py --trace replay_traces/2025-12-01/uploads.json --rest-base https://staging.api --grpc-addr staging.api:50051 --speedup 5` to re-emit traffic against staging.
 - Harness must support:
   - Time compression (speedup factor) for stress tests.
   - Selective amplification (e.g., duplicate upload traffic for scale testing).
-  - Metrics emission (success/failure, latency distribution) so dashboards mirror prod.
-
-Scripts are not yet implemented; this plan documents the contract so engineering tasks can be tracked.
+  - Metrics emission (success/failure, latency distribution) so dashboards mirror prod. The script already annotates responses and gRPC outcomes in stdout, making it easy to forward to parsing/metrics collectors.
 
 ## Isolation & Observability
 
@@ -55,6 +53,6 @@ Scripts are not yet implemented; this plan documents the contract so engineering
 
 ## Next Steps
 
-1. Implement `scripts/seed_demo_data.py` (Python) leveraging existing CloudSim APIs.
-2. Build `scripts/replay_traffic.py` with support for REST + gRPC payloads.
-3. Store synthetic datasets + traces in a secure storage bucket accessible to CI and staging pipelines.
+1. Automate scheduled runs of `seed_demo_data.py` + `replay_traffic.py` via CI or staging cronjobs.
+2. Expand sample datasets/traces as new feature sets emerge (e.g., search, comments, advanced ACLs).
+3. Store synthetic datasets + traces in a secure storage bucket accessible to CI and staging pipelines (current repo copy is for dev parity).

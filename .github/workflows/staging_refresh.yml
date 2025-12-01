@@ -1,0 +1,74 @@
+name: Staging Data Refresh
+
+on:
+  schedule:
+    - cron: '0 9 * * 1,4' # Mondays & Thursdays at 09:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: staging-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      REST_BASE: ${{ secrets.STAGING_REST_BASE }}
+      GRPC_ADDR: ${{ secrets.STAGING_GRPC_ADDR }}
+      AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+      USER_ID: ${{ secrets.STAGING_USER_ID }}
+      ORG_ID: ${{ secrets.STAGING_ORG_ID }}
+      USER_ROLES: ${{ secrets.STAGING_USER_ROLES }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate configuration
+        shell: bash
+        run: |
+          missing=0
+          for var in REST_BASE GRPC_ADDR AUTH_TOKEN; do
+            if [ -z "${!var}" ]; then
+              echo "::error::${var} secret is not configured";
+              missing=1;
+            fi
+          done
+          if [ "$missing" -eq 1 ]; then
+            exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: Seed staging data
+        env:
+          AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+        run: |
+          python scripts/seed_demo_data.py \
+            --env staging \
+            --rest-base "$REST_BASE" \
+            --grpc-addr "$GRPC_ADDR" \
+            --user-id "${USER_ID:-staging-seeder}" \
+            --org-id "${ORG_ID:-staging-org}" \
+            --user-roles "${USER_ROLES:-ops.admin}" \
+            --data-dir sample_data
+
+      - name: Replay baseline traces
+        env:
+          AUTH_TOKEN: ${{ secrets.STAGING_AUTH_TOKEN }}
+        run: |
+          python scripts/replay_traffic.py sample_data/traces/observability_seed.json \
+            --rest-base "$REST_BASE" \
+            --grpc-addr "$GRPC_ADDR" \
+            --user-id "${USER_ID:-staging-seeder}" \
+            --org-id "${ORG_ID:-staging-org}" \
+            --user-roles "${USER_ROLES:-ops.admin}" \
+            --speedup 10

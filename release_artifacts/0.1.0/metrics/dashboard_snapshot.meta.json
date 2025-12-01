@@ -1,0 +1,6 @@
+{
+  "object_url": "gs://nexusai-release-artifacts/0.1.0/dashboard_snapshot.png",
+  "sha256": null,
+  "generated_at": null,
+  "notes": "Run scripts/publish_dashboard_snapshot.py after exporting the Grafana PNG to populate this metadata."
+}

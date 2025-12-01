@@ -1,0 +1,33 @@
+[
+  {
+    "method": "GET",
+    "path": "/uploads:sessions/demo",
+    "delay_ms": 50
+  },
+  {
+    "rpc": "ObservabilityService.UpsertSLO",
+    "request": {
+      "context": {
+        "orgId": "org-demo",
+        "userId": "user-demo",
+        "scopes": ["ops.admin"]
+      },
+      "slo": {
+        "name": "seed-upload-latency",
+        "metric": "upload.latency.p95",
+        "threshold": 1800,
+        "comparator": "<",
+        "windowMinutes": 60
+      }
+    }
+  },
+  {
+    "rpc": "ObservabilityService.ListSLOs",
+    "request": {
+      "context": {
+        "orgId": "org-demo",
+        "userId": "user-demo"
+      }
+    }
+  }
+]

@@ -48,3 +48,5 @@ This playbook implements the release requirements from Section 7. Use it when pl
 - Maintain release issue template capturing scope, test evidence, approvals, and validation results.
 - Store monitoring snapshots + chaos/load reports under `release_artifacts/<version>/` (directory to be created per release).
 - Update Section 7 checklist to mark releases that met all criteria.
+- Use the scheduled GitHub Action (`.github/workflows/staging_refresh.yml`) to keep staging data fresh via `seed_demo_data.py` + `replay_traffic.py`. Update secrets (`STAGING_*`) whenever endpoints or tokens rotate.
+- After exporting Grafana dashboards, run `python scripts/publish_dashboard_snapshot.py <png> --object-url gs://.../<version>/dashboard_snapshot.png` to capture the checksum + metadata alongside the release artifacts.
