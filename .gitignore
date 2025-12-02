@@ -1,3 +1,23 @@
 CloudSim/cloudsim_state.json
 CloudSim/cloudsim_state.json.tmp
 .state/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Local data cache for real file uploads
+data/
+
+# Web UI build / dependencies
+webui/node_modules/
+webui/.cache/
+webui/dist/
+webui/*.tsbuildinfo
+webui/*.d.ts
+webui/vite.config.js
