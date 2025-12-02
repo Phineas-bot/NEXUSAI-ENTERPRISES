@@ -53,11 +53,22 @@ class RealFileStore:
         stream.seek(0)
         return str(target_path), size_bytes
 
-    def register_dataset(self, dataset_id: str, path: str, original_name: str, size_bytes: int) -> None:
+    def register_dataset(
+        self,
+        dataset_id: str,
+        path: str,
+        original_name: str,
+        size_bytes: int,
+        *,
+        file_id: Optional[str] = None,
+        file_name: Optional[str] = None,
+    ) -> None:
         self._entries[dataset_id] = {
             "path": path,
             "original_name": original_name,
             "size_bytes": int(size_bytes),
+            "file_id": file_id,
+            "file_name": file_name or original_name,
         }
         self._persist_index()
 
@@ -74,8 +85,9 @@ class RealFileStore:
             return None
         target = original_name.lower()
         for entry in self._entries.values():
-            name = str(entry.get("original_name", "")).lower()
-            if name == target and os.path.exists(entry.get("path", "")):
+            names = [entry.get("original_name", ""), entry.get("file_name", "")]
+            normalized = {str(name).lower() for name in names if name}
+            if target in normalized and os.path.exists(entry.get("path", "")):
                 return entry
         return None
 

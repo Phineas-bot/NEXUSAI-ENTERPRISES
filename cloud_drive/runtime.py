@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -49,11 +51,15 @@ class CloudDriveRuntime:
     @classmethod
     def bootstrap(cls, config: Optional[CloudDriveConfig] = None) -> "CloudDriveRuntime":
         cfg = config or CloudDriveConfig.default()
-        controller = CloudSimController()
+        state_root = Path(os.environ.get("CLOUD_DRIVE_STATE_DIR", Path.cwd() / "data" / "control-state")).expanduser()
+        state_root.mkdir(parents=True, exist_ok=True)
+        controller_state_path = state_root / "cloudsim_state.json"
+        metadata_state_path = state_root / "metadata_state.pkl"
+        controller = CloudSimController(enable_persistence=True, state_path=str(controller_state_path))
         bus = build_bus(cfg.message_bus.backend)
         telemetry = TelemetryCollector(cfg.observability)
 
-        metadata_service = MetadataService(config=cfg, telemetry=telemetry)
+        metadata_service = MetadataService(config=cfg, telemetry=telemetry, state_path=str(metadata_state_path))
         replica_manager = ReplicaManager(
             config=cfg,
             telemetry=telemetry,

@@ -1,20 +1,23 @@
 import { useEffect, useState } from 'react';
 import type { CloudConfig } from '../lib/api';
-import { inspectNode } from '../lib/api';
+import { failNode, inspectNode, removeNode, restoreNode } from '../lib/api';
 import type { NodeDetail } from '../types';
 
 type Props = {
   nodeId: string | null;
   config: CloudConfig;
   onClose(): void;
+  onRefresh(): void;
 };
 
-export function NodeInspector({ nodeId, config, onClose }: Props) {
+export function NodeInspector({ nodeId, config, onClose, onRefresh }: Props) {
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
 
-  useEffect(() => {
+  const loadDetail = () => {
     if (!nodeId) return;
     setLoading(true);
     setError(null);
@@ -22,7 +25,49 @@ export function NodeInspector({ nodeId, config, onClose }: Props) {
       .then((result) => setDetail(result.node))
       .catch((err) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false));
+  };
+
+  useEffect(() => {
+    loadDetail();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [nodeId, config]);
+
+  const runAction = async (label: string, task: () => Promise<void>, closeOnSuccess = false) => {
+    if (!nodeId) return;
+    try {
+      setBusyAction(label);
+      setStatus(null);
+      await task();
+      onRefresh();
+      loadDetail();
+      setStatus(`${label} complete`);
+      if (closeOnSuccess) {
+        onClose();
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setStatus(`${label} failed: ${message}`);
+    } finally {
+      setBusyAction(null);
+    }
+  };
+
+  const handleFail = () =>
+    runAction('Fail node', async () => {
+      await failNode(nodeId!, config);
+    });
+  const handleRestore = () =>
+    runAction('Restore node', async () => {
+      await restoreNode(nodeId!, config);
+    });
+  const handleDelete = () =>
+    runAction(
+      'Delete node',
+      async () => {
+        await removeNode(nodeId!, config);
+      },
+      true
+    );
 
   if (!nodeId) return null;
 
@@ -90,6 +135,34 @@ export function NodeInspector({ nodeId, config, onClose }: Props) {
                   </div>
                 ))}
               </div>
+            </section>
+
+            <section className="rounded-2xl border border-white/10 p-4 space-y-3">
+              <p className="text-xs uppercase tracking-[0.3em] text-slate-500">Lifecycle controls</p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <button
+                  onClick={handleFail}
+                  disabled={busyAction !== null}
+                  className="rounded-2xl border border-rose-400/60 py-2 text-sm font-semibold uppercase tracking-[0.3em] text-rose-300 disabled:opacity-40"
+                >
+                  {busyAction === 'Fail node' ? 'Failing…' : 'Fail node'}
+                </button>
+                <button
+                  onClick={handleRestore}
+                  disabled={busyAction !== null}
+                  className="rounded-2xl border border-emerald-400/60 py-2 text-sm font-semibold uppercase tracking-[0.3em] text-emerald-300 disabled:opacity-40"
+                >
+                  {busyAction === 'Restore node' ? 'Restoring…' : 'Restore node'}
+                </button>
+                <button
+                  onClick={handleDelete}
+                  disabled={busyAction !== null}
+                  className="rounded-2xl border border-white/20 py-2 text-sm font-semibold uppercase tracking-[0.3em] text-slate-200 disabled:opacity-40"
+                >
+                  {busyAction === 'Delete node' ? 'Deleting…' : 'Delete node'}
+                </button>
+              </div>
+              {status && <p className="text-xs text-slate-400">{status}</p>}
             </section>
           </div>
         )}

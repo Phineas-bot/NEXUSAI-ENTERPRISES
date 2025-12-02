@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from datetime import datetime, timezone, timedelta
 import uuid
+import pickle
+from pathlib import Path
 
 from ..config import CloudDriveConfig
 from ..models import FileEntry, FileManifest, FileVersion
@@ -17,10 +19,12 @@ from .base import BaseService
 class MetadataService(BaseService):
     """In-memory placeholder for metadata operations."""
 
+    state_path: Optional[str] = None
     _files: Dict[str, FileEntry] = None
     _manifests: Dict[str, FileManifest] = None
     _current_manifests: Dict[str, str] = None
     _file_versions: Dict[str, List[FileVersion]] = None
+    _state_file: Optional[Path] = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self._files is None:
@@ -31,6 +35,11 @@ class MetadataService(BaseService):
             self._current_manifests = {}
         if self._file_versions is None:
             self._file_versions = {}
+        if self.state_path:
+            self._state_file = Path(self.state_path).expanduser()
+            if self._state_file.parent:
+                self._state_file.parent.mkdir(parents=True, exist_ok=True)
+            self._load_state()
 
     def create_folder(self, org_id: str, parent_id: Optional[str], name: str, created_by: str) -> FileEntry:
         file_id = str(uuid.uuid4())
@@ -49,20 +58,55 @@ class MetadataService(BaseService):
         )
         self._files[file_id] = entry
         self.emit_event("folder_created", file_id=file_id, org_id=org_id)
+        self._persist_state()
         return entry
 
     def register_manifest(self, manifest: FileManifest) -> None:
         self._manifests[manifest.manifest_id] = manifest
         self._current_manifests[manifest.file_id] = manifest.manifest_id
         self.emit_event("manifest_registered", manifest_id=manifest.manifest_id)
+        self._persist_state()
 
     def upsert_manifest(self, manifest: FileManifest) -> None:
         self._manifests[manifest.manifest_id] = manifest
         self._current_manifests[manifest.file_id] = manifest.manifest_id
         self.emit_event("manifest_updated", manifest_id=manifest.manifest_id)
+        self._persist_state()
 
     def list_children(self, parent_id: Optional[str]) -> List[FileEntry]:
         return [f for f in self._files.values() if f.parent_id == parent_id and f.deleted_at is None]
+
+    def list_recent_files(
+        self,
+        *,
+        limit: int = 25,
+        include_folders: bool = False,
+        org_id: Optional[str] = None,
+    ) -> List[FileEntry]:
+        """Return the most recently updated files for dashboard consumers."""
+        if limit <= 0:
+            return []
+        candidates = [entry for entry in self._files.values() if entry.deleted_at is None]
+        if not include_folders:
+            candidates = [entry for entry in candidates if not entry.is_folder]
+        if org_id:
+            candidates = [entry for entry in candidates if entry.org_id == org_id]
+        candidates.sort(key=lambda entry: entry.updated_at, reverse=True)
+        return candidates[:limit]
+
+    def list_all_files(
+        self,
+        *,
+        include_folders: bool = False,
+        org_id: Optional[str] = None,
+    ) -> List[FileEntry]:
+        entries = [entry for entry in self._files.values() if entry.deleted_at is None]
+        if not include_folders:
+            entries = [entry for entry in entries if not entry.is_folder]
+        if org_id:
+            entries = [entry for entry in entries if entry.org_id == org_id]
+        entries.sort(key=lambda entry: (entry.name.lower(), entry.updated_at), reverse=False)
+        return entries
 
     def get_manifest(self, file_id: str) -> Optional[FileManifest]:
         manifest_id = self._current_manifests.get(file_id)
@@ -128,6 +172,7 @@ class MetadataService(BaseService):
             entry.mime_type = mime_type or entry.mime_type
             entry.deleted_at = None
             entry.deleted_by = None
+        self._persist_state()
         return entry
 
     def record_version(
@@ -160,6 +205,7 @@ class MetadataService(BaseService):
         )
         versions.append(version)
         self.emit_event("file_version_created", file_id=file_id, version_id=version.version_id)
+        self._persist_state()
         return version
 
     def list_versions(self, file_id: str) -> List[FileVersion]:
@@ -209,6 +255,7 @@ class MetadataService(BaseService):
         if change_summary is not None:
             version.change_summary = change_summary
         self.emit_event("file_version_metadata_updated", file_id=file_id, version_id=version_id)
+        self._persist_state()
         return version
 
     # Trash lifecycle ---------------------------------------------------------
@@ -219,6 +266,7 @@ class MetadataService(BaseService):
             entry.deleted_at = datetime.now(timezone.utc)
             entry.deleted_by = actor
             self.emit_event("file_trashed", file_id=file_id, actor=actor)
+            self._persist_state()
         return entry
 
     def list_trashed(self, *, org_id: Optional[str] = None) -> List[FileEntry]:
@@ -236,6 +284,7 @@ class MetadataService(BaseService):
             entry.parent_id = target_parent
         entry.updated_at = datetime.now(timezone.utc)
         self.emit_event("file_restored", file_id=file_id, actor=actor)
+        self._persist_state()
         return entry
 
     def purge_expired_trash(self, *, retention_days: int) -> List[str]:
@@ -255,4 +304,37 @@ class MetadataService(BaseService):
                     self._manifests.pop(manifest_id, None)
         if removed:
             self.emit_event("trash_purged", file_ids="|".join(removed))
+            self._persist_state()
         return removed
+
+    # Persistence helpers --------------------------------------------------
+
+    def _load_state(self) -> None:
+        if not self._state_file or not self._state_file.exists():
+            return
+        try:
+            with self._state_file.open("rb") as handle:
+                snapshot = pickle.load(handle)
+        except (OSError, pickle.PickleError):
+            return
+        self._files = snapshot.get("files", self._files)
+        self._manifests = snapshot.get("manifests", self._manifests)
+        self._current_manifests = snapshot.get("current_manifests", self._current_manifests)
+        self._file_versions = snapshot.get("file_versions", self._file_versions)
+
+    def _persist_state(self) -> None:
+        if not self._state_file:
+            return
+        payload = {
+            "files": self._files,
+            "manifests": self._manifests,
+            "current_manifests": self._current_manifests,
+            "file_versions": self._file_versions,
+        }
+        temp_path = self._state_file.with_suffix(self._state_file.suffix + ".tmp")
+        try:
+            with temp_path.open("wb") as handle:
+                pickle.dump(payload, handle)
+            temp_path.replace(self._state_file)
+        except OSError:
+            return

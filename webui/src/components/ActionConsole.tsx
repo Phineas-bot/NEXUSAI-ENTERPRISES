@@ -6,7 +6,7 @@ import type {
   NodeProvisionPayload,
   SimulationTickPayload
 } from '../lib/api';
-import { failNode, provisionNode, restoreNode, runSimulationTick, triggerDemoUpload } from '../lib/api';
+import { failNode, provisionNode, removeNode, restoreNode, runSimulationTick, triggerDemoUpload } from '../lib/api';
 
 type Props = {
   nodes: ClusterNode[];
@@ -59,6 +59,12 @@ export function ActionConsole({ nodes, config, onRefresh }: Props) {
   const handleRestore = async () => {
     if (!nodeId) return;
     await restoreNode(nodeId, config);
+  };
+
+  const handleDelete = async () => {
+    if (!nodeId) return;
+    await removeNode(nodeId, config);
+    setNodeId('');
   };
 
   const handleUpload = async () => {
@@ -124,7 +130,7 @@ export function ActionConsole({ nodes, config, onRefresh }: Props) {
             </option>
           ))}
         </select>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <button
             onClick={() => handleAction('Fail node', handleFail)}
             disabled={!nodeId || busyAction !== null}
@@ -138,6 +144,13 @@ export function ActionConsole({ nodes, config, onRefresh }: Props) {
             className="rounded-2xl border border-emerald-400/60 py-2 text-sm font-semibold uppercase tracking-[0.3em] text-emerald-300 disabled:opacity-40"
           >
             {busyAction === 'Restore node' ? 'Restoring…' : 'Restore node'}
+          </button>
+          <button
+            onClick={() => handleAction('Delete node', handleDelete)}
+            disabled={!nodeId || busyAction !== null}
+            className="rounded-2xl border border-white/20 py-2 text-sm font-semibold uppercase tracking-[0.3em] text-slate-200 disabled:opacity-40"
+          >
+            {busyAction === 'Delete node' ? 'Deleting…' : 'Delete node'}
           </button>
         </div>
       </div>

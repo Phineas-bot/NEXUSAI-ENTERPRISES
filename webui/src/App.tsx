@@ -14,6 +14,7 @@ import {
   CloudConfig,
   getActivity,
   getClusterNodes,
+  getFileCatalog,
   getRecentFiles,
   getSlo,
   getTransfers
@@ -23,6 +24,7 @@ function useDashboardData(config: CloudConfig) {
   const [nodes, setNodes] = useState<ClusterNode[]>([]);
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [files, setFiles] = useState<FileEntry[]>([]);
+  const [catalog, setCatalog] = useState<FileEntry[]>([]);
   const [events, setEvents] = useState<ActivityEvent[]>([]);
   const [slo, setSlo] = useState<SloPoint[]>([]);
   const [loading, setLoading] = useState(true);
@@ -33,10 +35,11 @@ function useDashboardData(config: CloudConfig) {
     setLoading(true);
     async function load() {
       try {
-        const [nodesData, transfersData, filesData, eventsData, sloData] = await Promise.all([
+        const [nodesData, transfersData, filesData, catalogData, eventsData, sloData] = await Promise.all([
           getClusterNodes(config),
           getTransfers(config),
           getRecentFiles(config),
+          getFileCatalog(config),
           getActivity(config),
           getSlo(config)
         ]);
@@ -44,6 +47,7 @@ function useDashboardData(config: CloudConfig) {
           setNodes(nodesData);
           setTransfers(transfersData);
           setFiles(filesData);
+          setCatalog(catalogData);
           setEvents(eventsData);
           setSlo(sloData);
         }
@@ -59,12 +63,12 @@ function useDashboardData(config: CloudConfig) {
 
   const refresh = () => setRefreshIndex((index) => index + 1);
 
-  return { nodes, transfers, files, events, slo, loading, refresh };
+  return { nodes, transfers, files, catalog, events, slo, loading, refresh };
 }
 
 export default function App() {
   const [config] = useState<CloudConfig>({ restBase: 'http://localhost:8000', userRoles: 'ops.admin' });
-  const { nodes, transfers, files, events, slo, loading, refresh } = useDashboardData(config);
+  const { nodes, transfers, files, catalog, events, slo, loading, refresh } = useDashboardData(config);
   const [inspectorNodeId, setInspectorNodeId] = useState<string | null>(null);
 
   useEffect(() => {
@@ -107,7 +111,7 @@ export default function App() {
               activeNodeId={inspectorNodeId}
               onSelectNode={(nodeId) => setInspectorNodeId(nodeId)}
             />
-            <FileExplorer files={files} />
+            <FileExplorer recentFiles={files} catalogFiles={catalog} />
           </div>
           <div className="space-y-6">
             <NodeAutoConnectPanel config={config} nodes={nodes} onRefresh={refresh} />
@@ -129,7 +133,12 @@ export default function App() {
           </div>
         )}
       </main>
-      <NodeInspector nodeId={inspectorNodeId} config={config} onClose={() => setInspectorNodeId(null)} />
+      <NodeInspector
+        nodeId={inspectorNodeId}
+        config={config}
+        onClose={() => setInspectorNodeId(null)}
+        onRefresh={refresh}
+      />
     </div>
   );
 }

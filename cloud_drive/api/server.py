@@ -484,6 +484,12 @@ async def list_recent_files(
     return [_serialize_recent_file(entry) for entry in entries]
 
 
+@app.get("/v1/files/catalog")
+async def list_file_catalog(include_folders: bool = False, ctx: AuthContext = Depends(get_auth_context)):
+    entries = runtime.api_gateway.list_all_files(include_folders=include_folders, org_id=ctx.org_id)
+    return [_serialize_recent_file(entry) for entry in entries]
+
+
 @app.get("/v1/activity")
 async def list_recent_activity(limit: int = 10):
     events = list(runtime.api_gateway.list_activity())
@@ -729,7 +735,14 @@ async def upload_real_file(
         raise HTTPException(status_code=500, detail=f"Unable to ingest file: {exc}") from exc
 
     dataset_id = getattr(transfer, "backing_file_id", None) or getattr(transfer, "file_id") or uuid.uuid4().hex
-    real_file_store.register_dataset(dataset_id, blob_path, file.filename, size_bytes)
+    real_file_store.register_dataset(
+        dataset_id,
+        blob_path,
+        file.filename,
+        size_bytes,
+        file_id=getattr(transfer, "file_id", None),
+        file_name=getattr(transfer, "file_name", file.filename),
+    )
     summary = _serialize_transfer_detail(transfer, source=entry_node, target=target_id)
     _record_ui_activity("Upload real file", file.filename, ctx, sizeBytes=size_bytes)
     return {
@@ -758,11 +771,14 @@ async def fetch_file(payload: FileFetchRequest, ctx: AuthContext = Depends(get_a
 @app.get("/v1/files/download-real/{dataset_id}")
 async def download_real_file(dataset_id: str, ctx: AuthContext = Depends(get_auth_context)):
     _ensure_ops_admin(ctx)
+    controller = _get_controller()
     entry = real_file_store.resolve(dataset_id)
     if not entry:
         entry = real_file_store.resolve_by_name(dataset_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    if not _dataset_has_live_replicas(controller, dataset_id, entry):
+        raise HTTPException(status_code=409, detail="Dataset unavailable; no healthy replicas online")
     file_path = entry.get("path")
     if not file_path:
         raise HTTPException(status_code=404, detail="Dataset missing path")
@@ -1066,6 +1082,9 @@ def _serialize_recent_file(entry) -> dict:
         "owner": entry.created_by,
         "sizeBytes": entry.size_bytes,
         "updatedAt": entry.updated_at.isoformat(),
+        "createdAt": entry.created_at.isoformat() if entry.created_at else entry.updated_at.isoformat(),
+        "mimeType": entry.mime_type,
+        "isFolder": bool(entry.is_folder),
     }
 
 
@@ -1171,6 +1190,28 @@ def _select_entry_node(preferred_id: Optional[str] = None) -> Optional[str]:
     if preferred_id and any(row.node_id == preferred_id for row in nodes):
         return preferred_id
     return nodes[0].node_id if nodes else preferred_id
+
+
+def _dataset_has_live_replicas(controller, dataset_id: str, entry: dict[str, Any]) -> bool:
+    network = getattr(controller, "network", None)
+    if network is None or not hasattr(network, "locate_file"):
+        return True
+    seen: set[str] = set()
+    candidates: list[str] = []
+    raw_tokens: list[Any] = [dataset_id, entry.get("file_id"), entry.get("file_name"), entry.get("original_name")]
+    for token in raw_tokens:
+        if token is None:
+            continue
+        identifier = str(token)
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+        candidates.append(identifier)
+    for identifier in candidates:
+        matches = network.locate_file(identifier)
+        if matches:
+            return True
+    return False
 
 
 def _spawn_transfer_burst(controller, count: int, *, ctx: Optional[AuthContext] = None) -> int:

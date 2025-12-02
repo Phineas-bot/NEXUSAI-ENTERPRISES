@@ -20,9 +20,33 @@ export const sampleEvents: ActivityEvent[] = [
 ];
 
 export const sampleFiles: FileEntry[] = [
-  { id: 'file-1', name: 'Launch_Playbook.docx', owner: 'Mara', sizeBytes: 1_200_000, updatedAt: '2025-11-29T21:05:00Z' },
-  { id: 'file-2', name: 'XR_Demo.mp4', owner: 'JT', sizeBytes: 2_560_000_000, updatedAt: '2025-11-30T14:15:00Z' },
-  { id: 'file-3', name: 'OpsChecklist.xlsx', owner: 'Phineas', sizeBytes: 860_000, updatedAt: '2025-11-28T11:40:00Z' }
+  {
+    id: 'file-1',
+    name: 'Launch_Playbook.docx',
+    owner: 'Mara',
+    sizeBytes: 1_200_000,
+    updatedAt: '2025-11-29T21:05:00Z',
+    createdAt: '2025-11-27T08:12:00Z',
+    mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  },
+  {
+    id: 'file-2',
+    name: 'XR_Demo.mp4',
+    owner: 'JT',
+    sizeBytes: 2_560_000_000,
+    updatedAt: '2025-11-30T14:15:00Z',
+    createdAt: '2025-11-20T13:45:00Z',
+    mimeType: 'video/mp4'
+  },
+  {
+    id: 'file-3',
+    name: 'OpsChecklist.xlsx',
+    owner: 'Phineas',
+    sizeBytes: 860_000,
+    updatedAt: '2025-11-28T11:40:00Z',
+    createdAt: '2025-11-18T11:40:00Z',
+    mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+  }
 ];
 
 export const sampleSlo: SloPoint[] = Array.from({ length: 12 }).map((_, index) => ({

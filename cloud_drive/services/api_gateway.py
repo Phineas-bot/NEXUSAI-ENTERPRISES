@@ -161,6 +161,30 @@ class APIGateway:
         self._refresh_search_index(file_id)
         return entry
 
+    def list_recent_files(
+        self,
+        *,
+        limit: int = 25,
+        include_folders: bool = False,
+        org_id: Optional[str] = None,
+    ):
+        return self.metadata_service.list_recent_files(
+            limit=limit,
+            include_folders=include_folders,
+            org_id=org_id,
+        )
+
+    def list_all_files(
+        self,
+        *,
+        include_folders: bool = False,
+        org_id: Optional[str] = None,
+    ):
+        return self.metadata_service.list_all_files(
+            include_folders=include_folders,
+            org_id=org_id,
+        )
+
     def purge_trash(self, retention_days: int) -> list[str]:
         removed = self.metadata_service.purge_expired_trash(retention_days=retention_days)
         for file_id in removed:

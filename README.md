@@ -2,6 +2,17 @@
 
 A lightweight simulator that models storage nodes, their network interconnects, and a discrete-event engine for testing bandwidth-aware transfers.
 
+## Control Center Web UI
+
+- Launch the new React/Vite dashboard under `webui/` for a polished operator experience:
+	```powershell
+	cd webui
+	npm install
+	npm run dev
+	```
+- Use the Environment panel (top-right) to set your CloudSim REST base (`https://staging.api` or `http://localhost:8000`) and optional bearer token. The UI will hydrate nodes, transfers, files, and observability data—falling back to sample data if the API is unreachable—so you can demo the project visually.
+- Production builds (`npm run build`) emit static assets ready for any CDN/FastAPI `StaticFiles` mount.
+
 ## Key Components
 
 - **Simulator**: Drives discrete events and enforces execution order based on absolute time.

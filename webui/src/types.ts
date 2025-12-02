@@ -49,6 +49,9 @@ export type FileEntry = {
   owner: string;
   sizeBytes: number;
   updatedAt: string;
+  createdAt?: string;
+  mimeType?: string;
+  isFolder?: boolean;
 };
 
 export type NodeFileEntry = {

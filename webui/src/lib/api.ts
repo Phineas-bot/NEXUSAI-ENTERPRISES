@@ -144,6 +144,14 @@ export async function getRecentFiles(config: CloudConfig = defaultConfig): Promi
   }
 }
 
+export async function getFileCatalog(config: CloudConfig = defaultConfig): Promise<FileEntry[]> {
+  try {
+    return await fetchJson<FileEntry[]>(`/v1/files/catalog`, config);
+  } catch {
+    return sampleFiles;
+  }
+}
+
 export async function getActivity(config: CloudConfig = defaultConfig): Promise<ActivityEvent[]> {
   try {
     return await fetchJson<ActivityEvent[]>(`/v1/activity?limit=10`, config);
